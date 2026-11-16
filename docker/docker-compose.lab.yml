@@ -1,0 +1,22 @@
+# Lab local imevts: imagem mayara-server:local (--emulator) na 6502.
+# Subir: ../scripts/dev/up-local.sh
+services:
+  mayara-server:
+    container_name: mayara-local
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: mayara-server:local
+    command: ["mayara-server", "--emulator"]
+    ports:
+      - "${MAYARA_HOST_PORT:-6502}:6502"
+    tmpfs:
+      - /home/mayara/.config/mayara
+      - /home/mayara/.local/share/mayara
+      - /tmp
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    restart: unless-stopped
