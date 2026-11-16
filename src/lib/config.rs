@@ -8,6 +8,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::path::PathBuf;
 use std::time::SystemTime;
+use utoipa::ToSchema;
 
 use crate::Brand;
 use crate::radar::RadarInfo;
@@ -116,11 +117,187 @@ pub(crate) struct TelemetryConfig {
     pub consent: Option<bool>,
 }
 
+/// Fixed composition window for the north-up geo echo overlay (independent of
+/// the radar Control Range).
+pub const GEO_ECHO_MIN_RANGE_M: f64 = 50.0;
+pub const GEO_ECHO_MAX_RANGE_M: f64 = 120.0 * 1852.0;
+pub const GEO_ECHO_ALLOWED_SIZES: &[u32] = &[1024, 2048, 4096];
+pub const GEO_ECHO_MIN_TARGET_M_PER_PX: f64 = 0.25;
+pub const GEO_ECHO_MAX_TARGET_M_PER_PX: f64 = 100.0;
+
+fn default_composition_range_m() -> f64 {
+    14.0 * 1852.0
+}
+
+fn default_echo_size_px() -> u32 {
+    2048
+}
+
+fn default_target_meters_per_px() -> f64 {
+    2.0
+}
+
+fn default_max_size_px() -> u32 {
+    2048
+}
+
+fn default_usable_bearing_start_deg() -> f64 {
+    0.0
+}
+
+fn default_usable_bearing_end_deg() -> f64 {
+    360.0
+}
+
+/// How the geo-echo overlay is produced for MapLibre.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum GeoEchoMode {
+    /// Fixed square centred on the radar (compositionRangeM × echoSizePx).
+    Composition,
+    /// Client-driven map bbox via `POST …/echo/viewport` (recommended).
+    #[default]
+    Viewport,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct GeoEchoConfig {
+    /// Active overlay workflow (`viewport` recommended).
+    #[serde(default)]
+    pub mode: GeoEchoMode,
+    /// Half-side of the composition square in metres (image edge to centre).
+    #[serde(default = "default_composition_range_m")]
+    pub composition_range_m: f64,
+    /// PNG edge length in pixels for composition mode; only 1024, 2048 or 4096.
+    #[serde(default = "default_echo_size_px")]
+    pub echo_size_px: u32,
+    /// Target metres per pixel for viewport mode (ideal scale).
+    #[serde(default = "default_target_meters_per_px")]
+    pub target_meters_per_px: f64,
+    /// Cap on viewport PNG edge length; only 1024, 2048 or 4096.
+    #[serde(default = "default_max_size_px")]
+    pub max_size_px: u32,
+    /// Usable sector start bearing in degrees (North = 0, clockwise).
+    #[serde(default = "default_usable_bearing_start_deg")]
+    pub usable_bearing_start_deg: f64,
+    /// Usable sector end bearing in degrees (North = 0, clockwise; 360 = full).
+    #[serde(default = "default_usable_bearing_end_deg")]
+    pub usable_bearing_end_deg: f64,
+}
+
+impl Default for GeoEchoConfig {
+    fn default() -> Self {
+        Self {
+            mode: GeoEchoMode::Viewport,
+            composition_range_m: default_composition_range_m(),
+            echo_size_px: default_echo_size_px(),
+            target_meters_per_px: default_target_meters_per_px(),
+            max_size_px: default_max_size_px(),
+            usable_bearing_start_deg: default_usable_bearing_start_deg(),
+            usable_bearing_end_deg: default_usable_bearing_end_deg(),
+        }
+    }
+}
+
+impl GeoEchoConfig {
+    /// Clamp / repair values loaded from disk so the compositor always sees a
+    /// usable window.
+    pub fn normalized(mut self) -> Self {
+        if !(GEO_ECHO_MIN_RANGE_M..=GEO_ECHO_MAX_RANGE_M).contains(&self.composition_range_m) {
+            self.composition_range_m = default_composition_range_m();
+        }
+        if !GEO_ECHO_ALLOWED_SIZES.contains(&self.echo_size_px) {
+            self.echo_size_px = default_echo_size_px();
+        }
+        if !(GEO_ECHO_MIN_TARGET_M_PER_PX..=GEO_ECHO_MAX_TARGET_M_PER_PX)
+            .contains(&self.target_meters_per_px)
+        {
+            self.target_meters_per_px = default_target_meters_per_px();
+        }
+        if !GEO_ECHO_ALLOWED_SIZES.contains(&self.max_size_px) {
+            self.max_size_px = default_max_size_px();
+        }
+        self.usable_bearing_start_deg = normalize_bearing_deg(self.usable_bearing_start_deg);
+        self.usable_bearing_end_deg = normalize_bearing_end_deg(self.usable_bearing_end_deg);
+        self
+    }
+
+    /// Validate a value coming from the API.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(GEO_ECHO_MIN_RANGE_M..=GEO_ECHO_MAX_RANGE_M).contains(&self.composition_range_m) {
+            return Err(format!(
+                "compositionRangeM must be between {} and {} metres",
+                GEO_ECHO_MIN_RANGE_M, GEO_ECHO_MAX_RANGE_M
+            ));
+        }
+        if !GEO_ECHO_ALLOWED_SIZES.contains(&self.echo_size_px) {
+            return Err(format!(
+                "echoSizePx must be one of {:?}",
+                GEO_ECHO_ALLOWED_SIZES
+            ));
+        }
+        if !(GEO_ECHO_MIN_TARGET_M_PER_PX..=GEO_ECHO_MAX_TARGET_M_PER_PX)
+            .contains(&self.target_meters_per_px)
+        {
+            return Err(format!(
+                "targetMetersPerPx must be between {} and {}",
+                GEO_ECHO_MIN_TARGET_M_PER_PX, GEO_ECHO_MAX_TARGET_M_PER_PX
+            ));
+        }
+        if !GEO_ECHO_ALLOWED_SIZES.contains(&self.max_size_px) {
+            return Err(format!(
+                "maxSizePx must be one of {:?}",
+                GEO_ECHO_ALLOWED_SIZES
+            ));
+        }
+        if !bearing_in_closed_range(self.usable_bearing_start_deg) {
+            return Err(
+                "usableBearingStartDeg must be between 0 and 360 (inclusive)".to_string(),
+            );
+        }
+        if !bearing_in_closed_range(self.usable_bearing_end_deg) {
+            return Err("usableBearingEndDeg must be between 0 and 360 (inclusive)".to_string());
+        }
+        Ok(())
+    }
+}
+
+fn normalize_bearing_deg(deg: f64) -> f64 {
+    if !deg.is_finite() {
+        return 0.0;
+    }
+    let mut d = deg % 360.0;
+    if d < 0.0 {
+        d += 360.0;
+    }
+    if (d - 360.0).abs() < 1e-9 {
+        0.0
+    } else {
+        d
+    }
+}
+
+fn normalize_bearing_end_deg(deg: f64) -> f64 {
+    if !deg.is_finite() {
+        return 360.0;
+    }
+    if (deg - 360.0).abs() < 1e-9 || deg > 360.0 && (deg % 360.0).abs() < 1e-9 {
+        return 360.0;
+    }
+    normalize_bearing_deg(deg)
+}
+
+fn bearing_in_closed_range(deg: f64) -> bool {
+    deg.is_finite() && (0.0..=360.0).contains(&deg)
+}
+
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub(crate) struct Config {
     pub radars: HashMap<String, Radar>,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    #[serde(default)]
+    pub geo_echo: GeoEchoConfig,
 }
 
 /// What the server may do about telemetry, and whether the GUI should put the
@@ -216,10 +393,7 @@ impl Persistence {
     /// failed to write, and stays `None` when it never wanted one.
     fn disabled(unwritable: Option<PathBuf>) -> Self {
         Persistence {
-            config: Config {
-                radars: HashMap::new(),
-                telemetry: TelemetryConfig::default(),
-            },
+            config: Config::default(),
             timestamp: SystemTime::UNIX_EPOCH,
             path: PathBuf::new(),
             unwritable,
@@ -275,10 +449,7 @@ impl Persistence {
         };
 
         let mut this = Persistence {
-            config: Config {
-                radars: HashMap::new(),
-                telemetry: TelemetryConfig::default(),
-            },
+            config: Config::default(),
             timestamp: SystemTime::UNIX_EPOCH,
             path: settings_path,
             unwritable: None,
@@ -484,6 +655,24 @@ impl Persistence {
             }
         }
         self.config.telemetry.install_id.clone()
+    }
+
+    /// Live geo-echo composition settings (normalized).
+    pub(crate) fn geo_echo(&self) -> GeoEchoConfig {
+        self.config.geo_echo.clone().normalized()
+    }
+
+    /// Persist geo-echo settings. Returns the stored (validated) config, or
+    /// an error when validation fails or the settings file cannot be written.
+    pub(crate) fn set_geo_echo(&mut self, cfg: GeoEchoConfig) -> Result<GeoEchoConfig, String> {
+        cfg.validate()?;
+        let previous = self.config.geo_echo.clone();
+        self.config.geo_echo = cfg.clone();
+        if self.is_storing() && !self.save() {
+            self.config.geo_echo = previous;
+            return Err("cannot store geo-echo settings".to_string());
+        }
+        Ok(cfg.normalized())
     }
 
     pub(crate) fn store(&mut self, radar_info: &RadarInfo) {
@@ -743,6 +932,95 @@ impl Persistence {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geo_echo_defaults_are_viewport_14nm_and_2048() {
+        let cfg = GeoEchoConfig::default();
+        assert_eq!(cfg.mode, GeoEchoMode::Viewport);
+        assert!((cfg.composition_range_m - 14.0 * 1852.0).abs() < 1e-9);
+        assert_eq!(cfg.echo_size_px, 2048);
+        assert!((cfg.target_meters_per_px - 2.0).abs() < 1e-9);
+        assert_eq!(cfg.max_size_px, 2048);
+        assert!((cfg.usable_bearing_start_deg - 0.0).abs() < 1e-9);
+        assert!((cfg.usable_bearing_end_deg - 360.0).abs() < 1e-9);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn geo_echo_rejects_invalid_size_and_range() {
+        assert!(
+            GeoEchoConfig {
+                composition_range_m: 10.0,
+                echo_size_px: 2048,
+                ..GeoEchoConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            GeoEchoConfig {
+                composition_range_m: 1852.0,
+                echo_size_px: 512,
+                ..GeoEchoConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            GeoEchoConfig {
+                target_meters_per_px: 0.01,
+                ..GeoEchoConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            GeoEchoConfig {
+                usable_bearing_start_deg: -1.0,
+                ..GeoEchoConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            GeoEchoConfig {
+                usable_bearing_end_deg: 361.0,
+                ..GeoEchoConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn geo_echo_config_round_trip_serde() {
+        let cfg = GeoEchoConfig {
+            mode: GeoEchoMode::Composition,
+            composition_range_m: 6.0 * 1852.0,
+            echo_size_px: 1024,
+            target_meters_per_px: 1.5,
+            max_size_px: 4096,
+            usable_bearing_start_deg: 10.0,
+            usable_bearing_end_deg: 350.0,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        let back: GeoEchoConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cfg);
+    }
+
+    #[test]
+    fn set_geo_echo_persists_in_memory_when_not_storing() {
+        let mut p = Persistence::disabled(None);
+        let cfg = GeoEchoConfig {
+            mode: GeoEchoMode::Composition,
+            composition_range_m: 6.0 * 1852.0,
+            echo_size_px: 1024,
+            ..GeoEchoConfig::default()
+        };
+        let saved = p.set_geo_echo(cfg.clone()).unwrap();
+        assert_eq!(saved, cfg);
+        assert_eq!(p.geo_echo(), cfg);
+    }
 
     fn persistence_with(key: &str, user_name: &str) -> Persistence {
         let mut radars = HashMap::new();

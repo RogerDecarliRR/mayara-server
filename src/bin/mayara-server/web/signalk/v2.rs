@@ -29,12 +29,12 @@ use crate::web::{signalk::diagnostics, spokes_handler};
 use super::super::{Message, Web, WebSocket, WebSocketUpgrade};
 use mayara::{
     Brand, Expectation, InterfaceApi, NetworkCheck,
-    config::{Consent, KnownRadar, SettingsStorage},
+    config::{Consent, GeoEchoConfig, GeoEchoMode, KnownRadar, SettingsStorage},
     course::RouteFetchError,
     navdata,
     radar::{
         GeoPosition, Legend, RadarError, RadarInfo, SharedRadars,
-        geo_echo::{self, Center, EchoCorners, EchoMeta, LonLat, SizePx},
+        geo_echo::{self, Center, EchoCorners, EchoMeta, LonLat, SizePx, BBox},
         settings::{BareControlValue, Control, ControlId, ControlValue, RadarControlValue},
         target::{ArpaTargetApi, MarpaRequest, TrackerCommand},
     },
@@ -62,6 +62,11 @@ const ROUTE_URI: &str = "/signalk/v2/api/resources/routes/{id}";
 const RADAR_TARGET_URI: &str = "/signalk/v2/api/vessels/self/radars/{radar_id}/targets/{target_id}";
 const RADAR_ECHO_JSON_URI: &str = "/signalk/v2/api/vessels/self/radars/{radar_id}/echo.json";
 const RADAR_ECHO_PNG_URI: &str = "/signalk/v2/api/vessels/self/radars/{radar_id}/echo.png";
+const RADAR_ECHO_VIEWPORT_URI: &str =
+    "/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport";
+const RADAR_ECHO_VIEWPORT_PNG_URI: &str =
+    "/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport.png";
+const GEO_ECHO_URI: &str = "/signalk/v2/api/geo-echo";
 
 /// How long a control PUT waits for the radar to object before it reports
 /// success. Most controls only send a reply when they reject a value.
@@ -104,6 +109,10 @@ const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
         get_route,
         get_echo_json,
         get_echo_png,
+        post_echo_viewport,
+        get_echo_viewport_png,
+        get_geo_echo,
+        set_geo_echo,
     ),
     components(schemas(
         RadarControlIdParam,
@@ -114,6 +123,10 @@ const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
         NetworkCheck,
         TelemetryState,
         TelemetryConsentRequest,
+        GeoEchoApi,
+        GeoEchoMode,
+        ViewportRequest,
+        ViewportResponse,
         Capabilities,
         BareControlValue,
         // Target types
@@ -140,6 +153,7 @@ pub(crate) fn routes(axum: axum::Router<Web>) -> axum::Router<Web> {
         .route(STATUS_URI, get(get_status))
         .route(NETWORK_CHECK_URI, get(get_network_check))
         .route(TELEMETRY_URI, get(get_telemetry).put(set_telemetry))
+        .route(GEO_ECHO_URI, get(get_geo_echo).put(set_geo_echo))
         .route(
             diagnostics::DIAGNOSTICS_URI,
             get(diagnostics::get_diagnostics),
@@ -160,6 +174,8 @@ pub(crate) fn routes(axum: axum::Router<Web>) -> axum::Router<Web> {
         .route(RADAR_TARGET_URI, axum::routing::delete(delete_target))
         .route(RADAR_ECHO_JSON_URI, get(get_echo_json))
         .route(RADAR_ECHO_PNG_URI, get(get_echo_png))
+        .route(RADAR_ECHO_VIEWPORT_URI, axum::routing::post(post_echo_viewport))
+        .route(RADAR_ECHO_VIEWPORT_PNG_URI, get(get_echo_viewport_png))
         .route(ROUTE_URI, get(get_route))
         .route(OPENAPI_URI, get(openapi_json))
         .merge(SwaggerUi::new("/swagger-ui").config(SwaggerConfig::new([OPENAPI_URI])))
@@ -622,6 +638,124 @@ async fn set_telemetry(SignalKJson(request): SignalKJson<TelemetryConsentRequest
     .into_response()
 }
 
+/// Geo echo overlay settings (`composition` fixed window or `viewport` map bbox).
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct GeoEchoApi {
+    #[schema(example = "viewport")]
+    mode: GeoEchoMode,
+    #[schema(example = 25928.0)]
+    composition_range_m: f64,
+    #[schema(example = 2048)]
+    echo_size_px: u32,
+    #[schema(example = 2.0)]
+    target_meters_per_px: f64,
+    #[schema(example = 2048)]
+    max_size_px: u32,
+    #[schema(example = 0.0)]
+    usable_bearing_start_deg: f64,
+    #[schema(example = 360.0)]
+    usable_bearing_end_deg: f64,
+}
+
+impl From<&GeoEchoConfig> for GeoEchoApi {
+    fn from(cfg: &GeoEchoConfig) -> Self {
+        Self {
+            mode: cfg.mode,
+            composition_range_m: cfg.composition_range_m,
+            echo_size_px: cfg.echo_size_px,
+            target_meters_per_px: cfg.target_meters_per_px,
+            max_size_px: cfg.max_size_px,
+            usable_bearing_start_deg: cfg.usable_bearing_start_deg,
+            usable_bearing_end_deg: cfg.usable_bearing_end_deg,
+        }
+    }
+}
+
+impl From<GeoEchoApi> for GeoEchoConfig {
+    fn from(api: GeoEchoApi) -> Self {
+        Self {
+            mode: api.mode,
+            composition_range_m: api.composition_range_m,
+            echo_size_px: api.echo_size_px,
+            target_meters_per_px: api.target_meters_per_px,
+            max_size_px: api.max_size_px,
+            usable_bearing_start_deg: api.usable_bearing_start_deg,
+            usable_bearing_end_deg: api.usable_bearing_end_deg,
+        }
+    }
+}
+
+/// Map bbox for a viewport echo render (lon/lat).
+#[derive(Clone, Debug, Serialize, Deserialize, ToSchema, PartialEq)]
+#[serde(rename_all = "camelCase")]
+struct ViewportRequest {
+    west: f64,
+    south: f64,
+    east: f64,
+    north: f64,
+}
+
+/// Viewport render result — same shape as `echo.json` plus PNG path and scale.
+#[derive(Clone, Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct ViewportResponse {
+    #[serde(flatten)]
+    meta: EchoMeta,
+    /// Requested map bbox (lon/lat).
+    bbox: ViewportRequest,
+    /// Effective metres per pixel after size clamp.
+    meters_per_px: f64,
+    /// Fetch the PNG published by this POST (`…/echo/viewport.png`).
+    png_path: String,
+}
+
+#[utoipa::path(
+    get,
+    path = "/signalk/v2/api/geo-echo",
+    summary = "Geo echo settings",
+    description = "Dual-mode overlay: `viewport` (recommended, map bbox) or `composition` \
+                   (fixed NM window). Includes bearing mask and viewport scale caps.",
+    responses((status = 200, body = GeoEchoApi, description = "Current geo-echo settings")),
+    tag = "Configuration"
+)]
+async fn get_geo_echo(State(state): State<Web>) -> Response {
+    let cfg = state.radars.geo_echo_config();
+    Json(GeoEchoApi::from(&cfg)).into_response()
+}
+
+#[utoipa::path(
+    put,
+    path = "/signalk/v2/api/geo-echo",
+    summary = "Update geo echo settings",
+    description = "Persists mode, compositionRangeM (50 m … 120 NM), echoSizePx / maxSizePx \
+                   (1024 | 2048 | 4096), targetMetersPerPx, and usable bearing sector \
+                   (0…360°, North=0 clockwise; wraps when start>end).",
+    request_body(content = GeoEchoApi, example = json!({
+        "mode": "viewport",
+        "compositionRangeM": 25928.0,
+        "echoSizePx": 2048,
+        "targetMetersPerPx": 2.0,
+        "maxSizePx": 2048,
+        "usableBearingStartDeg": 0.0,
+        "usableBearingEndDeg": 360.0
+    })),
+    responses(
+        (status = 200, body = GeoEchoApi, description = "Stored geo-echo settings"),
+        (status = 400, description = "Value out of range or invalid")
+    ),
+    tag = "Configuration"
+)]
+async fn set_geo_echo(
+    State(state): State<Web>,
+    SignalKJson(request): SignalKJson<GeoEchoApi>,
+) -> Response {
+    match state.radars.set_geo_echo_config(GeoEchoConfig::from(request)) {
+        Ok(cfg) => Json(GeoEchoApi::from(&cfg)).into_response(),
+        Err(message) => SignalKResponse::failed(StatusCode::BAD_REQUEST, message),
+    }
+}
+
 #[utoipa::path(
     get,
     path = "/signalk/v2/api/vessels/self/radars/{radar_id}",
@@ -675,7 +809,8 @@ async fn get_echo_json(Path(radar_id): Path<String>, State(state): State<Web>) -
     get,
     path = "/signalk/v2/api/vessels/self/radars/{radar_id}/echo.png",
     summary = "Georeferenced echo PNG",
-    description = "North-up 1024×1024 RGBA radar echo. Transparent PNG when unavailable (HTTP 200).",
+    description = "North-up RGBA radar echo (size from geo-echo config, default 2048×2048). \
+                   Transparent PNG when unavailable (HTTP 200).",
     params(
         ("radar_id" = String, Path, description = "Radar identifier", example = "emu0")
     ),
@@ -693,6 +828,99 @@ async fn get_echo_png(Path(radar_id): Path<String>, State(state): State<Web>) ->
         .read()
         .map(|f| f.png.clone())
         .unwrap_or_else(|_| geo_echo::EchoFrame::unavailable().png);
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        png,
+    )
+        .into_response()
+}
+
+#[utoipa::path(
+    post,
+    path = "/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport",
+    summary = "Render geo echo for a map viewport",
+    description = "Projects the latest polar buffer into a north-up PNG covering the \
+                   requested bbox (lon/lat). Size = min(maxSizePx, ceil(max(spanEW, spanNS) / \
+                   targetMetersPerPx)). Bearing mask from geo-echo config applies. \
+                   Returns metadata; fetch PNG at `pngPath` (`…/echo/viewport.png`).",
+    params(
+        ("radar_id" = String, Path, description = "Radar identifier", example = "emu0")
+    ),
+    request_body(content = ViewportRequest, example = json!({
+        "west": -40.08,
+        "south": -19.87,
+        "east": -40.04,
+        "north": -19.83
+    })),
+    responses(
+        (status = 200, body = ViewportResponse, description = "Viewport frame metadata + pngPath"),
+        (status = 400, description = "Invalid bbox"),
+        (status = 404, description = "Radar not found")
+    ),
+    tag = "Radars"
+)]
+async fn post_echo_viewport(
+    Path(radar_id): Path<String>,
+    State(state): State<Web>,
+    SignalKJson(request): SignalKJson<ViewportRequest>,
+) -> Response {
+    if state.radars.get_by_key(&radar_id).is_none() {
+        return no_such_radar(&radar_id, &state.radars);
+    }
+    let bbox = BBox {
+        west: request.west,
+        south: request.south,
+        east: request.east,
+        north: request.north,
+    };
+    match geo_echo::publish_viewport(&state.radars, &radar_id, bbox) {
+        Ok(meta) => {
+            let (span_ew, span_ns) = bbox.spans_m();
+            let span = span_ew.max(span_ns).max(1e-6);
+            let size = meta.size_px.width.max(1) as f64;
+            let png_path = format!(
+                "/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport.png"
+            );
+            Json(ViewportResponse {
+                meta,
+                bbox: request,
+                meters_per_px: span / size,
+                png_path,
+            })
+            .into_response()
+        }
+        Err(message) => SignalKResponse::failed(StatusCode::BAD_REQUEST, message),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport.png",
+    summary = "Last viewport geo echo PNG",
+    description = "PNG published by the most recent `POST …/echo/viewport` for this radar. \
+                   Transparent PNG when no viewport has been posted yet (HTTP 200).",
+    params(
+        ("radar_id" = String, Path, description = "Radar identifier", example = "emu0")
+    ),
+    responses(
+        (status = 200, description = "PNG image (image/png)"),
+        (status = 404, description = "Radar not found")
+    ),
+    tag = "Radars"
+)]
+async fn get_echo_viewport_png(
+    Path(radar_id): Path<String>,
+    State(state): State<Web>,
+) -> Response {
+    if state.radars.get_by_key(&radar_id).is_none() {
+        return no_such_radar(&radar_id, &state.radars);
+    }
+    // Ensure compositor (and empty viewport slot) exist.
+    let _ = geo_echo::ensure_entry(&state.radars, &radar_id);
+    let png = geo_echo::viewport_frame(&radar_id)
+        .and_then(|slot| slot.read().ok().map(|f| f.png.clone()))
+        .unwrap_or_else(|| geo_echo::EchoFrame::unavailable().png);
     (
         StatusCode::OK,
         [(axum::http::header::CONTENT_TYPE, "image/png")],

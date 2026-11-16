@@ -1,7 +1,7 @@
 //! Shared echo snapshot types.
 
 use super::corners::{EchoCorners, LonLat};
-use super::png::{transparent_png, ECHO_SIZE_PX};
+use super::png::{transparent_png, DEFAULT_ECHO_SIZE_PX};
 use bytes::Bytes;
 use serde::Serialize;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,6 +45,20 @@ pub struct EchoFrame {
 
 impl EchoFrame {
     pub fn unavailable() -> Self {
+        Self::unavailable_sized(DEFAULT_ECHO_SIZE_PX)
+    }
+
+    pub fn unavailable_sized(size_px: u32) -> Self {
+        let size_px = size_px.max(1);
+        let png = match size_px {
+            1024 | 2048 | 4096 => transparent_png(size_px),
+            other => {
+                let rgba = vec![0u8; (other as usize) * (other as usize) * 4];
+                super::png::encode_rgba(other, other, &rgba).unwrap_or_else(|_| {
+                    transparent_png(DEFAULT_ECHO_SIZE_PX)
+                })
+            }
+        };
         Self {
             meta: EchoMeta {
                 version: 1,
@@ -56,8 +70,8 @@ impl EchoFrame {
                 range_m: 0.0,
                 north_up: true,
                 size_px: SizePx {
-                    width: ECHO_SIZE_PX,
-                    height: ECHO_SIZE_PX,
+                    width: size_px,
+                    height: size_px,
                 },
                 corners: EchoCorners {
                     tl: LonLat { lon: 0.0, lat: 0.0 },
@@ -66,7 +80,7 @@ impl EchoFrame {
                     bl: LonLat { lon: 0.0, lat: 0.0 },
                 },
             },
-            png: Bytes::from_static(transparent_png()),
+            png: Bytes::from(png),
         }
     }
 }
@@ -87,8 +101,8 @@ mod tests {
         let f = EchoFrame::unavailable();
         assert!(!f.meta.available);
         assert_eq!(f.meta.version, 1);
-        assert_eq!(f.meta.size_px.width, 1024);
-        assert_eq!(f.meta.size_px.height, 1024);
+        assert_eq!(f.meta.size_px.width, 2048);
+        assert_eq!(f.meta.size_px.height, 2048);
         assert!(f.meta.north_up);
         assert!(!f.png.is_empty());
         assert_eq!(&f.png[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);

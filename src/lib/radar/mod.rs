@@ -1116,6 +1116,23 @@ impl SharedRadars {
             .ensure_install_id()
     }
 
+    /// Composition window for the geo-echo overlay (thread-safe read).
+    pub fn geo_echo_config(&self) -> crate::config::GeoEchoConfig {
+        self.radars.read().unwrap().persistent_data.geo_echo()
+    }
+
+    /// Persist and apply geo-echo composition settings (next published frame).
+    pub fn set_geo_echo_config(
+        &self,
+        cfg: crate::config::GeoEchoConfig,
+    ) -> Result<crate::config::GeoEchoConfig, String> {
+        self.radars
+            .write()
+            .unwrap()
+            .persistent_data
+            .set_geo_echo(cfg)
+    }
+
     /// Store a change to a registered radar. Only the registration currently
     /// held under the radar's key is changed: a receiver still winding down
     /// after its radar was forgotten, or replaced under the same key, must not

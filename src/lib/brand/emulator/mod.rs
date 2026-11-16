@@ -81,6 +81,7 @@ pub(crate) const EMULATOR_RANGES: &[i32] = &[
     16000,
     NM * 12,
     24000,
+    NM * 14,
     NM * 16,
     36000,
     NM * 24,

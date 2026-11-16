@@ -790,8 +790,8 @@ async fn test_echo_json_contract() {
     assert!(json["refreshIntervalMs"].is_number());
     assert!(json["refreshIntervalMs"].as_u64().unwrap() >= 1000);
     assert!(json["northUp"].as_bool().unwrap());
-    assert_eq!(json["sizePx"]["width"], 1024);
-    assert_eq!(json["sizePx"]["height"], 1024);
+    assert_eq!(json["sizePx"]["width"], 2048);
+    assert_eq!(json["sizePx"]["height"], 2048);
     for corner in ["tl", "tr", "br", "bl"] {
         assert!(json["corners"][corner]["lat"].is_number());
         assert!(json["corners"][corner]["lon"].is_number());
@@ -834,4 +834,115 @@ async fn test_echo_unknown_radar_returns_404() {
 
     let png_resp = get_response("/signalk/v2/api/vessels/self/radars/no-such-radar/echo.png").await;
     assert_eq!(png_resp.status(), 404);
+}
+
+// ============================================================================
+// GET / PUT /signalk/v2/api/geo-echo
+// ============================================================================
+
+#[tokio::test]
+#[ignore = "requires running server"]
+async fn test_geo_echo_get_defaults() {
+    let json = get_json("/signalk/v2/api/geo-echo").await;
+    assert_eq!(json["mode"], "viewport");
+    assert!((json["compositionRangeM"].as_f64().unwrap() - 14.0 * 1852.0).abs() < 1.0);
+    assert_eq!(json["echoSizePx"], 2048);
+    assert!((json["targetMetersPerPx"].as_f64().unwrap() - 2.0).abs() < 1e-9);
+    assert_eq!(json["maxSizePx"], 2048);
+    assert!((json["usableBearingStartDeg"].as_f64().unwrap() - 0.0).abs() < 1e-9);
+    assert!((json["usableBearingEndDeg"].as_f64().unwrap() - 360.0).abs() < 1e-9);
+}
+
+#[tokio::test]
+#[ignore = "requires running server"]
+async fn test_geo_echo_put_roundtrip() {
+    let body = serde_json::json!({
+        "mode": "composition",
+        "compositionRangeM": 6.0 * 1852.0,
+        "echoSizePx": 1024,
+        "targetMetersPerPx": 1.5,
+        "maxSizePx": 4096,
+        "usableBearingStartDeg": 10.0,
+        "usableBearingEndDeg": 350.0
+    });
+    let resp = put_json("/signalk/v2/api/geo-echo", &body).await;
+    assert_eq!(resp.status(), 200);
+    let saved: Value = resp.json().await.unwrap();
+    assert_eq!(saved["mode"], "composition");
+    assert!((saved["compositionRangeM"].as_f64().unwrap() - 6.0 * 1852.0).abs() < 1e-6);
+    assert_eq!(saved["echoSizePx"], 1024);
+    assert!((saved["targetMetersPerPx"].as_f64().unwrap() - 1.5).abs() < 1e-9);
+    assert_eq!(saved["maxSizePx"], 4096);
+    assert!((saved["usableBearingStartDeg"].as_f64().unwrap() - 10.0).abs() < 1e-9);
+    assert!((saved["usableBearingEndDeg"].as_f64().unwrap() - 350.0).abs() < 1e-9);
+
+    let got = get_json("/signalk/v2/api/geo-echo").await;
+    assert_eq!(got["echoSizePx"], 1024);
+    assert!((got["compositionRangeM"].as_f64().unwrap() - 6.0 * 1852.0).abs() < 1e-6);
+
+    // Restore default for other tests.
+    let restore = serde_json::json!({
+        "mode": "viewport",
+        "compositionRangeM": 14.0 * 1852.0,
+        "echoSizePx": 2048,
+        "targetMetersPerPx": 2.0,
+        "maxSizePx": 2048,
+        "usableBearingStartDeg": 0.0,
+        "usableBearingEndDeg": 360.0
+    });
+    let resp = put_json("/signalk/v2/api/geo-echo", &restore).await;
+    assert_eq!(resp.status(), 200);
+}
+
+#[tokio::test]
+#[ignore = "requires running server"]
+async fn test_geo_echo_put_rejects_bad_size() {
+    let body = serde_json::json!({
+        "mode": "viewport",
+        "compositionRangeM": 1852.0,
+        "echoSizePx": 512,
+        "targetMetersPerPx": 2.0,
+        "maxSizePx": 2048,
+        "usableBearingStartDeg": 0.0,
+        "usableBearingEndDeg": 360.0
+    });
+    let resp = put_json("/signalk/v2/api/geo-echo", &body).await;
+    assert_eq!(resp.status(), 400);
+}
+
+#[tokio::test]
+#[ignore = "requires running server"]
+async fn test_echo_viewport_post_returns_png_path() {
+    let id = first_radar_id().await;
+    let body = serde_json::json!({
+        "west": -40.08,
+        "south": -19.87,
+        "east": -40.04,
+        "north": -19.83
+    });
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/signalk/v2/api/vessels/self/radars/{id}/echo/viewport",
+        base_url()
+    );
+    let resp = client.post(&url).json(&body).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let json: Value = resp.json().await.unwrap();
+    assert!(json["version"].is_number());
+    assert!(json["available"].is_boolean());
+    assert!(json["pngPath"].as_str().unwrap().ends_with("/echo/viewport.png"));
+    assert!(json["metersPerPx"].as_f64().unwrap() > 0.0);
+    assert_eq!(json["bbox"]["west"], -40.08);
+
+    let png_resp = get_response(&format!(
+        "/signalk/v2/api/vessels/self/radars/{id}/echo/viewport.png"
+    ))
+    .await;
+    assert_eq!(png_resp.status(), 200);
+    let ctype = png_resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(ctype.starts_with("image/png"));
 }

@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Mayara — Geo Echo Configuration</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            max-width: 520px;
+            margin: 40px auto;
+            padding: 0 20px;
+            line-height: 1.5;
+            color: #222;
+        }
+        h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+        p.hint { color: #555; margin-top: 0; }
+        label { display: block; margin-top: 1rem; font-weight: 600; }
+        .field-hint { display: block; font-weight: 400; color: #666; font-size: 0.9rem; margin-top: 0.25rem; }
+        input, select {
+            display: block;
+            width: 100%;
+            margin-top: 0.35rem;
+            padding: 0.45rem 0.55rem;
+            font-size: 1rem;
+            box-sizing: border-box;
+        }
+        button {
+            margin-top: 1.25rem;
+            padding: 0.55rem 1.1rem;
+            font-size: 1rem;
+            cursor: pointer;
+        }
+        #status { margin-top: 1rem; min-height: 1.4em; }
+        #status.err { color: #a40000; }
+        #status.ok { color: #0a6b0a; }
+        a { color: #0066cc; }
+        .mode-block { margin-top: 0.5rem; }
+        .mode-block[hidden] { display: none; }
+    </style>
+</head>
+<body>
+    <p><a href="/">← Mayara</a></p>
+    <h1>Geo Echo Configuration</h1>
+    <p class="hint">MapLibre radar echo overlay. Independent of Control Range.</p>
+
+    <form id="geo-echo-form">
+        <label for="mode">Mode</label>
+        <select id="mode" name="mode" required>
+            <option value="viewport">viewport (map bbox — recommended)</option>
+            <option value="composition">composition (fixed NM window)</option>
+        </select>
+
+        <div id="composition-fields" class="mode-block">
+            <label for="compositionNm">Composition range (NM)</label>
+            <input id="compositionNm" name="compositionNm" type="number" min="0.027" max="120" step="any" required />
+
+            <label for="echoSizePx">PNG resolution (px)</label>
+            <select id="echoSizePx" name="echoSizePx" required>
+                <option value="1024">1024</option>
+                <option value="2048">2048</option>
+                <option value="4096">4096</option>
+            </select>
+        </div>
+
+        <div id="viewport-fields" class="mode-block">
+            <label for="targetMetersPerPx">Target metres per pixel</label>
+            <input id="targetMetersPerPx" name="targetMetersPerPx" type="number" min="0.25" max="100" step="any" required />
+            <span class="field-hint">Aim for up to 2 m/px; when the PNG hits max size, zooming out degrades resolution (m/px worsens).</span>
+
+            <label for="maxSizePx">Max PNG size (px)</label>
+            <select id="maxSizePx" name="maxSizePx" required>
+                <option value="1024">1024</option>
+                <option value="2048">2048</option>
+                <option value="4096">4096</option>
+            </select>
+        </div>
+
+        <label for="usableBearingStartDeg">Usable bearing start (°)</label>
+        <input id="usableBearingStartDeg" name="usableBearingStartDeg" type="number" min="0" max="360" step="any" required />
+        <span class="field-hint">North = 0, clockwise. Sector wraps when start &gt; end.</span>
+
+        <label for="usableBearingEndDeg">Usable bearing end (°)</label>
+        <input id="usableBearingEndDeg" name="usableBearingEndDeg" type="number" min="0" max="360" step="any" required />
+        <span class="field-hint">Use 360 for a full circle from 0.</span>
+
+        <button type="submit">Save</button>
+    </form>
+    <div id="status" role="status"></div>
+
+    <script>
+        const NM = 1852;
+        const API = "/signalk/v2/api/geo-echo";
+        const form = document.getElementById("geo-echo-form");
+        const statusEl = document.getElementById("status");
+        const modeSelect = document.getElementById("mode");
+        const nmInput = document.getElementById("compositionNm");
+        const sizeSelect = document.getElementById("echoSizePx");
+        const targetMpp = document.getElementById("targetMetersPerPx");
+        const maxSizeSelect = document.getElementById("maxSizePx");
+        const bearingStart = document.getElementById("usableBearingStartDeg");
+        const bearingEnd = document.getElementById("usableBearingEndDeg");
+        const compositionFields = document.getElementById("composition-fields");
+        const viewportFields = document.getElementById("viewport-fields");
+
+        function setStatus(text, ok) {
+            statusEl.textContent = text;
+            statusEl.className = ok === true ? "ok" : ok === false ? "err" : "";
+        }
+
+        function syncModeUi() {
+            const viewport = modeSelect.value === "viewport";
+            compositionFields.hidden = viewport;
+            viewportFields.hidden = !viewport;
+            nmInput.required = !viewport;
+            sizeSelect.required = !viewport;
+            targetMpp.required = viewport;
+            maxSizeSelect.required = viewport;
+        }
+
+        function applyData(data) {
+            modeSelect.value = data.mode === "composition" ? "composition" : "viewport";
+            nmInput.value = (data.compositionRangeM / NM);
+            sizeSelect.value = String(data.echoSizePx);
+            targetMpp.value = data.targetMetersPerPx;
+            maxSizeSelect.value = String(data.maxSizePx);
+            bearingStart.value = data.usableBearingStartDeg;
+            bearingEnd.value = data.usableBearingEndDeg;
+            syncModeUi();
+        }
+
+        async function load() {
+            const res = await fetch(API);
+            if (!res.ok) {
+                setStatus("Failed to load settings (" + res.status + ")", false);
+                return;
+            }
+            const data = await res.json();
+            applyData(data);
+            setStatus("", null);
+        }
+
+        modeSelect.addEventListener("change", syncModeUi);
+
+        form.addEventListener("submit", async (ev) => {
+            ev.preventDefault();
+            const body = {
+                mode: modeSelect.value,
+                compositionRangeM: Number(nmInput.value) * NM,
+                echoSizePx: Number(sizeSelect.value),
+                targetMetersPerPx: Number(targetMpp.value),
+                maxSizePx: Number(maxSizeSelect.value),
+                usableBearingStartDeg: Number(bearingStart.value),
+                usableBearingEndDeg: Number(bearingEnd.value),
+            };
+            setStatus("Saving…", null);
+            const res = await fetch(API, {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                setStatus(data.message || ("Save failed (" + res.status + ")"), false);
+                return;
+            }
+            applyData(data);
+            setStatus("Saved. Applied on the next echo / viewport frame.", true);
+        });
+
+        load().catch((e) => setStatus(String(e), false));
+    </script>
+</body>
+</html>

@@ -35,6 +35,7 @@ static ALL_POSSIBLE_NAUTICAL_RANGES: LazyLock<Ranges> = LazyLock::new(|| {
         Range::initial(NM * 6),     // 6 nm
         Range::initial(NM * 8),     // 8 nm
         Range::initial(NM * 12),    // 12 nm
+        Range::initial(NM * 14),    // 14 nm
         Range::initial(NM * 16),    // 16 nm
         Range::initial(NM * 24),    // 24 nm
         Range::initial(NM * 32),    // 32 nm

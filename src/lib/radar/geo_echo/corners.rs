@@ -54,6 +54,7 @@ pub fn refresh_interval_ms(period_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::super::target::{METERS_PER_DEGREE_LATITUDE, meters_per_degree_longitude};
 
     #[test]
     fn corners_are_north_up_square() {
@@ -64,6 +65,25 @@ mod tests {
         assert!(c.bl.lon < c.br.lon);
         assert!((c.tl.lat - c.tr.lat).abs() < 1e-12);
         assert!((c.bl.lat - c.br.lat).abs() < 1e-12);
+    }
+
+    #[test]
+    fn corner_metric_ew_matches_ns() {
+        let lat = -19.85;
+        let lon = -40.06;
+        let range_m = 14.0 * 1852.0;
+        let c = corners_for(lat, lon, range_m);
+        let ns = (c.tl.lat - c.bl.lat) * METERS_PER_DEGREE_LATITUDE;
+        let ew = (c.tr.lon - c.tl.lon) * meters_per_degree_longitude(&lat);
+        assert!(
+            (ns - 2.0 * range_m).abs() < 1e-6,
+            "N–S span {ns} != 2×range"
+        );
+        assert!(
+            (ew - 2.0 * range_m).abs() < 1e-6,
+            "E–W span {ew} != 2×range"
+        );
+        assert!((ns - ew).abs() < 1e-6, "N–S {ns} vs E–W {ew}");
     }
 
     #[test]
