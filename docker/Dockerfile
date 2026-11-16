@@ -1,15 +1,25 @@
+# syntax=docker/dockerfile:1
 FROM rust:1.94-alpine AS builder
+# Prefer IPv4 *before* any network fetch: Alpine CDN / crates.io AAAA often
+# stall in Docker/WSL (apk I/O error, Cargo "spurious network error").
+RUN printf 'precedence :ffff:0:0/96  100\n' > /etc/gai.conf
 # `curl` is needed at build time by utoipa-swagger-ui's build.rs to fetch
 # the Swagger UI bundle; without it the build fails with `curl command not
-# found`. `perl` is required by openssl-sys.
-RUN apk add --no-cache build-base curl perl cmake
+# found`. `perl` is required by openssl-sys. `git` + CLI fetch: git deps in
+# Cargo.toml (nmea-parser / tokio-tungstenite) respect gai.conf.
+RUN apk add --no-cache build-base curl perl cmake git
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 WORKDIR /usr/src/mayara-server
 
-# Cache downloaded crates: build.rs requires the full source tree so it fails
-# here, but cargo compiles dependencies first, so they are cached.
+# BuildKit cache mounts keep crates.io / git deps and `target/` across rebuilds
+# (even when Cargo.toml changes). The release binary is copied out of the
+# `target` mount into the image layer so the final stage can COPY it.
 COPY Cargo.lock Cargo.toml build.rs ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs \
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/mayara-server/target \
+    mkdir src && echo "fn main() {}" > src/main.rs \
     && cargo build --release 2>/dev/null || true \
     && rm -rf src
 
@@ -20,16 +30,21 @@ COPY src src/
 # unless its source file is present.
 COPY examples examples/
 COPY web web/
-RUN cargo build --release
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/usr/src/mayara-server/target \
+    cargo build --release \
+    && cp /usr/src/mayara-server/target/release/mayara-server /usr/src/mayara-server/mayara-server
 
 FROM alpine:3.21
 LABEL org.opencontainers.image.source="https://github.com/MarineYachtRadar/mayara-server"
 LABEL org.opencontainers.image.title="mayara-server"
 LABEL org.opencontainers.image.description="Marine radar server with REST API and WebSocket support"
 LABEL org.opencontainers.image.license="Apache-2.0"
-RUN apk add --no-cache tini \
+RUN printf 'precedence :ffff:0:0/96  100\n' > /etc/gai.conf \
+    && apk add --no-cache tini \
     && adduser -D -h /home/mayara mayara
-COPY --from=builder /usr/src/mayara-server/target/release/mayara-server /usr/local/bin/mayara-server
+COPY --from=builder /usr/src/mayara-server/mayara-server /usr/local/bin/mayara-server
 # Names this deployment in the usage stats a user may agree to send, so a
 # container install is not counted as someone running the binary by hand.
 # A packager that builds on this image overrides it (the Signal K plugin

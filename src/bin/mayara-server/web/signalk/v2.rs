@@ -34,6 +34,7 @@ use mayara::{
     navdata,
     radar::{
         GeoPosition, Legend, RadarError, RadarInfo, SharedRadars,
+        geo_echo::{self, Center, EchoCorners, EchoMeta, LonLat, SizePx},
         settings::{BareControlValue, Control, ControlId, ControlValue, RadarControlValue},
         target::{ArpaTargetApi, MarpaRequest, TrackerCommand},
     },
@@ -59,6 +60,8 @@ const RADAR_CONTROL_URI: &str =
 const RADAR_TARGETS_URI: &str = "/signalk/v2/api/vessels/self/radars/{radar_id}/targets";
 const ROUTE_URI: &str = "/signalk/v2/api/resources/routes/{id}";
 const RADAR_TARGET_URI: &str = "/signalk/v2/api/vessels/self/radars/{radar_id}/targets/{target_id}";
+const RADAR_ECHO_JSON_URI: &str = "/signalk/v2/api/vessels/self/radars/{radar_id}/echo.json";
+const RADAR_ECHO_PNG_URI: &str = "/signalk/v2/api/vessels/self/radars/{radar_id}/echo.png";
 
 /// How long a control PUT waits for the radar to object before it reports
 /// success. Most controls only send a reply when they reject a value.
@@ -99,6 +102,8 @@ const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
         delete_target,
         control_stream_docs,
         get_route,
+        get_echo_json,
+        get_echo_png,
     ),
     components(schemas(
         RadarControlIdParam,
@@ -120,6 +125,11 @@ const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
         Subscription,
         Desubscription,
         RadarControlValue,
+        EchoMeta,
+        Center,
+        SizePx,
+        EchoCorners,
+        LonLat,
     ))
 )]
 struct ApiDoc;
@@ -148,6 +158,8 @@ pub(crate) fn routes(axum: axum::Router<Web>) -> axum::Router<Web> {
         )
         .route(RADAR_TARGETS_URI, get(get_targets).post(acquire_target))
         .route(RADAR_TARGET_URI, axum::routing::delete(delete_target))
+        .route(RADAR_ECHO_JSON_URI, get(get_echo_json))
+        .route(RADAR_ECHO_PNG_URI, get(get_echo_png))
         .route(ROUTE_URI, get(get_route))
         .route(OPENAPI_URI, get(openapi_json))
         .merge(SwaggerUi::new("/swagger-ui").config(SwaggerConfig::new([OPENAPI_URI])))
@@ -631,6 +643,62 @@ async fn get_radar_info(Path(radar_id): Path<String>, State(state): State<Web>) 
     } else {
         no_such_radar(&radar_id, &state.radars)
     }
+}
+
+#[utoipa::path(
+    get,
+    path = "/signalk/v2/api/vessels/self/radars/{radar_id}/echo.json",
+    summary = "Georeferenced echo frame metadata",
+    description = "North-up radar echo metadata for MapLibre image overlays. \
+                   When no position or frame is ready, `available` is false (HTTP 200).",
+    params(
+        ("radar_id" = String, Path, description = "Radar identifier", example = "emu0")
+    ),
+    responses(
+        (status = 200, body = EchoMeta, description = "Echo frame metadata"),
+        (status = 404, description = "Radar not found")
+    ),
+    tag = "Radars"
+)]
+async fn get_echo_json(Path(radar_id): Path<String>, State(state): State<Web>) -> Response {
+    let Some(slot) = geo_echo::ensure_running(&state.radars, &radar_id) else {
+        return no_such_radar(&radar_id, &state.radars);
+    };
+    let meta = slot
+        .read()
+        .map(|f| f.meta.clone())
+        .unwrap_or_else(|_| geo_echo::EchoFrame::unavailable().meta);
+    Json(meta).into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/signalk/v2/api/vessels/self/radars/{radar_id}/echo.png",
+    summary = "Georeferenced echo PNG",
+    description = "North-up 1024×1024 RGBA radar echo. Transparent PNG when unavailable (HTTP 200).",
+    params(
+        ("radar_id" = String, Path, description = "Radar identifier", example = "emu0")
+    ),
+    responses(
+        (status = 200, description = "PNG image (image/png)"),
+        (status = 404, description = "Radar not found")
+    ),
+    tag = "Radars"
+)]
+async fn get_echo_png(Path(radar_id): Path<String>, State(state): State<Web>) -> Response {
+    let Some(slot) = geo_echo::ensure_running(&state.radars, &radar_id) else {
+        return no_such_radar(&radar_id, &state.radars);
+    };
+    let png = slot
+        .read()
+        .map(|f| f.png.clone())
+        .unwrap_or_else(|_| geo_echo::EchoFrame::unavailable().png);
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "image/png")],
+        png,
+    )
+        .into_response()
 }
 
 #[utoipa::path(

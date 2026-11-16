@@ -25,6 +25,7 @@ use utoipa::ToSchema;
 
 pub mod cpa;
 pub mod exclusion;
+pub mod geo_echo;
 pub mod range;
 pub mod settings;
 pub mod spoke;

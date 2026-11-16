@@ -1,11 +1,15 @@
 # Lab local imevts: imagem mayara-server:local (--emulator) na 6502.
 # Subir: ../scripts/dev/up-local.sh
+# FK-1 smoke: só --emulator (cenário embutido HALO). static-position porto só com land/marks ou RM-124.
 services:
   mayara-server:
     container_name: mayara-local
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      # Host network during build: same IPv4 path as the host (avoids broken
+      # container IPv6 → crates.io / GitHub timeouts).
+      network: host
     image: mayara-server:local
     command: ["mayara-server", "--emulator"]
     ports:

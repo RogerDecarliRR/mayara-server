@@ -112,7 +112,7 @@ fi
 
 if (( FORCE_BUILD )); then
   export DOCKER_BUILDKIT=1
-  echo "==> docker compose up -d --build (Dockerfile do clone; Rust/Alpine pode demorar) …"
+  echo "==> docker compose up -d --build (Dockerfile do clone; Rust/Alpine; build network=host + IPv4 preferido; pode demorar) …"
   if ! compose up -d --build; then
     compose_fail_hint
     exit 1

@@ -768,3 +768,70 @@ async fn test_discovery_claims_no_v1_rest_tree() {
         "v1 must not advertise a REST tree mayara does not serve"
     );
 }
+
+// ============================================================================
+// GET …/radars/{id}/echo.json and echo.png (geo echo overlay)
+// ============================================================================
+
+#[tokio::test]
+#[ignore = "requires running server"]
+async fn test_echo_json_contract() {
+    let id = first_radar_id().await;
+    let json = get_json(&format!(
+        "/signalk/v2/api/vessels/self/radars/{}/echo.json",
+        id
+    ))
+    .await;
+
+    assert_eq!(json["version"], 1);
+    assert!(json["available"].is_boolean());
+    assert!(json["generatedMs"].is_number());
+    assert!(json["revolutionId"].is_number());
+    assert!(json["refreshIntervalMs"].is_number());
+    assert!(json["refreshIntervalMs"].as_u64().unwrap() >= 1000);
+    assert!(json["northUp"].as_bool().unwrap());
+    assert_eq!(json["sizePx"]["width"], 1024);
+    assert_eq!(json["sizePx"]["height"], 1024);
+    for corner in ["tl", "tr", "br", "bl"] {
+        assert!(json["corners"][corner]["lat"].is_number());
+        assert!(json["corners"][corner]["lon"].is_number());
+    }
+    assert!(json["center"]["lat"].is_number());
+    assert!(json["center"]["lon"].is_number());
+    assert!(json["rangeM"].is_number());
+}
+
+#[tokio::test]
+#[ignore = "requires running server"]
+async fn test_echo_png_is_png() {
+    let id = first_radar_id().await;
+    let response = get_response(&format!(
+        "/signalk/v2/api/vessels/self/radars/{}/echo.png",
+        id
+    ))
+    .await;
+
+    assert_eq!(response.status(), 200);
+    let ctype = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ctype.starts_with("image/png"),
+        "expected image/png, got {ctype}"
+    );
+    let bytes = response.bytes().await.unwrap();
+    assert!(bytes.len() > 8);
+    assert_eq!(&bytes[0..8], &[137, 80, 78, 71, 13, 10, 26, 10]);
+}
+
+#[tokio::test]
+#[ignore = "requires running server"]
+async fn test_echo_unknown_radar_returns_404() {
+    let json_resp = get_response("/signalk/v2/api/vessels/self/radars/no-such-radar/echo.json").await;
+    assert_eq!(json_resp.status(), 404);
+
+    let png_resp = get_response("/signalk/v2/api/vessels/self/radars/no-such-radar/echo.png").await;
+    assert_eq!(png_resp.status(), 404);
+}
