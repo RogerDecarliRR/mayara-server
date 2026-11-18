@@ -59,6 +59,8 @@ const WEAK_MARK_INTENSITY: u8 = 6;
 
 // Conversion constants
 const DEG_TO_RAD: f64 = PI / 180.0;
+/// Half antenna beam width (1°), same as Sweep `HALF_BEAM_WIDTH` in report.rs.
+const HALF_BEAM_WIDTH: f64 = 1.0 * DEG_TO_RAD;
 
 /// Radius of the half-circle turn when reversing course (meters)
 pub(crate) const TURN_RADIUS: f64 = 100.0;
@@ -812,17 +814,26 @@ impl EmulatorWorld {
         Echo::NONE
     }
 
-    /// Get the radar return intensity at a given position (legacy method)
-    #[allow(dead_code)]
-    pub(crate) fn get_intensity(
+    /// Full echo at a position (viewport sampler / Doppler-ready).
+    pub(crate) fn get_echo(
         &self,
         _boat_pos: &GeoPosition,
         bearing_rad: f64,
         distance: f64,
-    ) -> u8 {
+    ) -> Echo {
         let (sin_b, cos_b) = bearing_rad.sin_cos();
-        let boats = self.boats_on_spoke(sin_b, cos_b, 0.0);
-        self.echo_fast(sin_b, cos_b, distance, &boats).intensity
+        let boats = self.boats_on_spoke(sin_b, cos_b, HALF_BEAM_WIDTH);
+        self.echo_fast(sin_b, cos_b, distance, &boats)
+    }
+
+    /// Get the radar return intensity at a given position (viewport / tests).
+    pub(crate) fn get_intensity(
+        &self,
+        boat_pos: &GeoPosition,
+        bearing_rad: f64,
+        distance: f64,
+    ) -> u8 {
+        self.get_echo(boat_pos, bearing_rad, distance).intensity
     }
 }
 

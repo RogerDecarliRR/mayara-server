@@ -573,6 +573,77 @@ div.myr_ppi {
 }
 
 /* ============================================
+   LPS symbols lozenge - ARPA gold-square debug (right of route)
+   ============================================ */
+
+.myr_lps_lozenge {
+  position: absolute;
+  bottom: 20px;
+  left: 112px; /* Right of route (66px + 36px + borders + 6px gap) */
+  display: flex;
+  align-items: stretch;
+  height: 36px;
+  background: rgba(0, 0, 0, 0.7);
+  border: 2px solid #446;
+  border-radius: 18px;
+  z-index: 100;
+  overflow: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.myr_lps_lozenge_button {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  padding: 0;
+  background: #222;
+  border: none;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.myr_lps_lozenge_button:hover {
+  background: #333;
+}
+
+.myr_lps_lozenge_button:active {
+  transform: scale(0.95);
+}
+
+.myr_lps_lozenge_button:focus-visible {
+  outline: 2px solid #e0a526;
+  outline-offset: 2px;
+}
+
+.myr_lps_icon {
+  width: 18px;
+  height: 18px;
+  stroke-width: 2;
+  stroke-linejoin: round;
+  fill: none;
+}
+
+.myr_lps_lozenge.myr_lps_on .myr_lps_lozenge_button {
+  background: #3d321a;
+}
+
+.myr_lps_lozenge.myr_lps_on .myr_lps_icon {
+  stroke: #e0a526;
+  fill: rgba(224, 165, 38, 0.45);
+}
+
+.myr_lps_lozenge.myr_lps_off .myr_lps_lozenge_button {
+  background: #2a2a2a;
+}
+
+.myr_lps_lozenge.myr_lps_off .myr_lps_icon {
+  stroke: #666;
+  fill: none;
+}
+
+/* ============================================
    Route Lozenge - active route toggle (bottom-left, right of AIS)
    ============================================ */
 

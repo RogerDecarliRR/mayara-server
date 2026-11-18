@@ -5,11 +5,14 @@ use super::super::{Legend, RadarInfo, SharedRadars};
 use super::corners::{corners_for, refresh_interval_ms};
 use super::frame::{now_unix_ms, Center, EchoFrame, EchoMeta, SizePx};
 use super::png::encode_rgba;
+use super::annulus::{
+    bbox_half_min_span_m, snap_range_step_up, view_m_per_bin, VIEWPORT_RANGE_STEPS_M,
+};
 use super::raster::{
-    rasterize_polar_masked, rasterize_viewport, viewport_image_corners, viewport_size_px, BBox,
+    rasterize_polar_masked, rasterize_viewport, rasterize_viewport_with_world,
+    view_range_from_bbox, viewport_image_corners, viewport_size_px, BBox,
 };
 use super::state::{PolarBuffer, RevClock};
-use crate::config::GeoEchoMode;
 use crate::navdata;
 use crate::protos::RadarMessage::RadarMessage;
 use bytes::Bytes;
@@ -125,10 +128,15 @@ pub fn ensure_entry(
 
 /// Render a viewport frame from the latest polar snapshot into the viewport
 /// slot. Returns the published meta, or an error string.
+///
+/// `site`: optional antenna (lat, lon). When `Some`, used as `radar_lat`/`radar_lon`
+/// in [`rasterize_viewport`] instead of the polar snapshot centre — so a polar
+/// buffer still tagged at Sneek can paint into a port bbox.
 pub fn publish_viewport(
     radars: &SharedRadars,
     radar_id: &str,
     bbox: BBox,
+    site: Option<(f64, f64)>,
 ) -> Result<EchoMeta, String> {
     bbox.validate()?;
     let (_, viewport_slot, snapshot_slot) = ensure_entry(radars, radar_id)
@@ -140,20 +148,50 @@ pub fn publish_viewport(
         .clone();
 
     let geo = radars.geo_echo_config();
+    // Acquisition horizon (ARPA/blob): spokes only exist out to Control Range.
+    // Keep Range on composition_range_m in viewport mode too — map zoom must
+    // not shrink the detector's horizon (PNG pitch still uses view_step snap).
+    ensure_composition_radar_range(radars, radar_id, geo.composition_range_m);
+
     let (span_ew, span_ns) = bbox.spans_m();
-    let size_px = viewport_size_px(
-        span_ew,
-        span_ns,
-        geo.target_meters_per_px,
-        geo.max_size_px,
-    );
+    // Snap metric = half of the smaller span (not diagonal — that over-snapped).
+    let half_min_m = bbox_half_min_span_m(bbox);
+    let view_half_m = view_range_from_bbox(bbox);
+    let max_m = geo.max_viewport_range_ceiling();
+    let view_step_m = snap_range_step_up(half_min_m, VIEWPORT_RANGE_STEPS_M, max_m);
+
+    // Prefer live radar geometry; snapshot may still be empty pre-revolution.
+    let (spokes, spoke_len, legend_live) = radars
+        .get_by_key(radar_id)
+        .map(|info| {
+            (
+                info.spokes_per_revolution.max(1) as usize,
+                info.max_spoke_len.max(1) as usize,
+                info.get_legend(),
+            )
+        })
+        .unwrap_or((
+            snap.spokes.max(1),
+            snap.spoke_len.max(1),
+            snap.legend.clone(),
+        ));
+
+    // size_px after snap: effective target ≤ m_bin (floor GEO_ECHO_MIN_TARGET_M_PER_PX)
+    // so fine zoom yields a denser PNG instead of stretching a ~92px raster.
+    let m_bin = view_m_per_bin(view_step_m, spoke_len);
+    let effective_target = geo
+        .target_meters_per_px
+        .min(m_bin.max(crate::config::GEO_ECHO_MIN_TARGET_M_PER_PX));
+    let size_px = viewport_size_px(span_ew, span_ns, effective_target, geo.max_size_px);
     let refresh = refresh_interval_ms(snap.period_ms);
     let meters_per_px = {
         let span = span_ew.max(span_ns).max(1e-6);
         span / size_px.max(1) as f64
     };
 
-    let Some((lat, lon)) = snap.center.or_else(resolve_nav_center) else {
+    let Some((lat, lon)) =
+        resolve_viewport_site(site, snap.center, resolve_nav_center())
+    else {
         let mut cold = EchoFrame::unavailable_sized(size_px);
         cold.meta.revolution_id = snap.revolution_id;
         cold.meta.refresh_interval_ms = refresh;
@@ -164,19 +202,45 @@ pub fn publish_viewport(
         return Ok(cold.meta);
     };
 
-    let rgba = rasterize_viewport(
-        &snap.data,
-        snap.spokes,
-        snap.spoke_len,
-        &snap.legend,
-        size_px,
-        lat,
-        lon,
-        snap.spoke_range_m,
-        bbox,
-        geo.usable_bearing_start_deg,
-        geo.usable_bearing_end_deg,
-    );
+    // Annular inverse-sample at snapped view_step. Range is forced above for
+    // ARPA acquisition; PNG pitch still follows view_step. Emulator / world
+    // sampler fills intensities from geography — same bbox+asset ⇒ same PNG
+    // regardless of the operator's previous Range dial.
+    let world = radars.viewport_world_sampler(radar_id);
+    let rgba = if let Some(ref sampler) = world {
+        sampler.prepare();
+        let echo = |bearing: f64, range: f64| sampler.echo_at(bearing, range);
+        rasterize_viewport_with_world(
+            &[],
+            spokes,
+            spoke_len,
+            &legend_live,
+            size_px,
+            lat,
+            lon,
+            0.0,
+            view_step_m,
+            bbox,
+            geo.usable_bearing_start_deg,
+            geo.usable_bearing_end_deg,
+            Some(&echo),
+        )
+    } else {
+        rasterize_viewport(
+            &snap.data,
+            snap.spokes.max(1),
+            snap.spoke_len.max(1),
+            &snap.legend,
+            size_px,
+            lat,
+            lon,
+            snap.spoke_range_m,
+            view_step_m,
+            bbox,
+            geo.usable_bearing_start_deg,
+            geo.usable_bearing_end_deg,
+        )
+    };
     let png_bytes = encode_rgba(size_px, size_px, &rgba)
         .map_err(|e| format!("png encode failed: {e}"))?;
 
@@ -191,7 +255,8 @@ pub fn publish_viewport(
             lat: (bbox.south + bbox.north) * 0.5,
             lon: (bbox.west + bbox.east) * 0.5,
         },
-        range_m: span_ew.max(span_ns) * 0.5,
+        // Snapped Mayara range step (half_min metric) — client shows this degrau.
+        range_m: view_step_m,
         north_up: true,
         size_px: SizePx {
             width: size_px,
@@ -199,9 +264,6 @@ pub fn publish_viewport(
         },
         corners,
     };
-    // Attach meters_per_px via range_m already; callers also compute from size.
-    let _ = meters_per_px;
-
     if let Ok(mut slot) = viewport_slot.write() {
         *slot = EchoFrame {
             meta: meta.clone(),
@@ -209,7 +271,9 @@ pub fn publish_viewport(
         };
     }
     debug!(
-        "geo_echo {radar_id}: viewport size={size_px} m_per_px={meters_per_px:.3} rev={}",
+        "geo_echo {radar_id}: viewport size={size_px} m_per_px={meters_per_px:.3} \
+         view_step_m={view_step_m:.1} view_half_m={view_half_m:.1} spoke_range_m={:.1} rev={}",
+        snap.spoke_range_m,
         snap.revolution_id
     );
     Ok(meta)
@@ -404,11 +468,19 @@ fn range_needs_align(current_m: Option<f64>, desired_m: f64) -> bool {
     }
 }
 
-/// Composition mode: keep radar `ControlId::Range` on `composition_range_m` so
-/// spokes cover the full composition disk (`scale ≈ spoke_range/composition`).
-/// Viewport mode must **not** call this — the map wants sharp local pixels and
-/// the polar PPI may stay on the operator's current range.
-fn ensure_composition_radar_range(radars: &SharedRadars, key: &str, composition_range_m: f64) {
+/// Keep radar `ControlId::Range` on `composition_range_m` whenever geo-echo is
+/// active (composition **and** viewport).
+///
+/// ARPA / blob acquisition only sees spokes out to the GUI Control Range; if
+/// viewport left Range on the operator zoom, detection would be clipped short
+/// of the configured horizon. Composition also needs full-disk spoke cover
+/// (`scale ≈ spoke_range/composition`). Viewport PNG pitch still uses the
+/// annular `view_step` snap — this only widens hardware/emulator acquisition.
+pub(crate) fn ensure_composition_radar_range(
+    radars: &SharedRadars,
+    key: &str,
+    composition_range_m: f64,
+) {
     if composition_range_m <= 0.0 {
         return;
     }
@@ -431,10 +503,10 @@ fn ensure_composition_radar_range(radars: &SharedRadars, key: &str, composition_
     let cv = ControlValue::new(ControlId::Range, composition_range_m.into());
     match info.controls.process_client_request(cv, reply_tx) {
         Ok(()) => debug!(
-            "geo_echo {key}: composition forced Range → {desired_m:.0} m (was {:?})",
+            "geo_echo {key}: forced Range → {desired_m:.0} m (was {:?}; acquisition=composition_range_m)",
             current_m
         ),
-        Err(e) => debug!("geo_echo {key}: composition Range align skipped: {e}"),
+        Err(e) => debug!("geo_echo {key}: Range align skipped: {e}"),
     }
 }
 
@@ -473,11 +545,9 @@ fn publish_frame(
     let size_px = geo.echo_size_px;
     let refresh = refresh_interval_ms(clock.period_ms());
 
-    // Composition only: align GUI/hardware Range to compositionRangeM so eco
-    // data fills the disk (not just echo.json corners). Viewport leaves Range alone.
-    if geo.mode == GeoEchoMode::Composition {
-        ensure_composition_radar_range(radars, key, composition_range_m);
-    }
+    // Both modes: align GUI/hardware Range to compositionRangeM so spokes
+    // (and ARPA/blob) cover the configured horizon, not the operator zoom.
+    ensure_composition_radar_range(radars, key, composition_range_m);
 
     let spoke_range_m = resolve_spoke_range_m(radars, key, polar);
 
@@ -543,9 +613,18 @@ fn publish_frame(
     );
 }
 
+/// Prefer explicit antenna site over polar/nav centre (viewport remap).
+pub(crate) fn resolve_viewport_site(
+    site: Option<(f64, f64)>,
+    snap_center: Option<(f64, f64)>,
+    nav: Option<(f64, f64)>,
+) -> Option<(f64, f64)> {
+    site.or(snap_center).or(nav)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{nearest_valid_range_m, range_needs_align};
+    use super::{nearest_valid_range_m, range_needs_align, resolve_viewport_site};
 
     #[test]
     fn nearest_valid_range_picks_closest_settable() {
@@ -555,10 +634,32 @@ mod tests {
         assert_eq!(nearest_valid_range_m(None, 1234.0), 1234.0);
     }
 
+    /// Viewport + ARPA share the same acquisition horizon: composition_range_m
+    /// (snapped to a settable Range). Operator zoom (e.g. 1 NM) must still
+    /// realign — otherwise blob/ARPA only sees spokes inside the GUI zoom.
     #[test]
     fn range_align_skips_when_already_on_composition() {
-        assert!(!range_needs_align(Some(25928.0), 25928.0));
-        assert!(range_needs_align(Some(1852.0), 25928.0));
-        assert!(range_needs_align(None, 25928.0));
+        let composition_horizon_m = 25928.0; // ~14 NM settable
+        assert!(!range_needs_align(
+            Some(composition_horizon_m),
+            composition_horizon_m
+        ));
+        // Viewport zoom at 1 NM must still force Range up to composition.
+        assert!(range_needs_align(Some(1852.0), composition_horizon_m));
+        assert!(range_needs_align(None, composition_horizon_m));
+    }
+
+    #[test]
+    fn viewport_site_overrides_polar_center() {
+        let polar_a = (53.03, 5.66);
+        let site_b = (-19.85, -40.06);
+        assert_eq!(
+            resolve_viewport_site(Some(site_b), Some(polar_a), None),
+            Some(site_b)
+        );
+        assert_eq!(
+            resolve_viewport_site(None, Some(polar_a), None),
+            Some(polar_a)
+        );
     }
 }

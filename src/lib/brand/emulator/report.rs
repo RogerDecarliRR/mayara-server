@@ -1,4 +1,5 @@
 use std::f64::consts::{PI, TAU};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use num_traits::FromPrimitive;
@@ -15,6 +16,7 @@ use super::{
     EMULATOR_RANGES, EMULATOR_SPOKE_LEN, EMULATOR_SPOKES, get_initial_position, spoke_step,
 };
 use crate::Cli;
+use crate::radar::geo_echo::ViewportWorldSampler;
 use crate::radar::settings::{ControlId, ControlUpdate};
 use crate::radar::spoke::GenericSpoke;
 use crate::radar::{
@@ -47,12 +49,20 @@ const LAND_INTENSITY: u8 = 14;
 /// radar pulse has a length of its own.
 const MIN_ECHO_PIXELS: f64 = 2.0;
 
+/// Viewport world sampling uses a fixed min radius so GUI Range cannot
+/// inflate boat footprints via `update_cache`.
+const VIEWPORT_WORLD_MIN_RADIUS_M: f64 = 1.0;
+
 pub(crate) struct EmulatorReportReceiver {
     common: CommonRadar,
     command_sender: Option<Command>,
+    /// Shared with geo_echo viewport sampler (GUI Range independent).
+    radars: SharedRadars,
 
     // Emulator state
-    world: EmulatorWorld,
+    world: Arc<Mutex<EmulatorWorld>>,
+    /// Boat position mirrored for the viewport sampler (same lock order: boat then world).
+    boat_for_sampler: Arc<Mutex<GeoPosition>>,
     /// Where the test scenario in `world` was built around
     world_origin: GeoPosition,
     coast: CoastView,
@@ -76,6 +86,8 @@ pub(crate) struct EmulatorReportReceiver {
     doppler_mode: DopplerMode,
     doppler_threshold: f64, // m/s
     receiver: Receiver,
+    /// Shared with viewport sampler so gain/sea/rain match the PPI.
+    receiver_for_sampler: Arc<Mutex<Receiver>>,
     last_update: Instant,
     rotation_count: u32,
 }
@@ -96,7 +108,15 @@ impl EmulatorReportReceiver {
 
         let control_update_rx = info.control_update_subscribe();
         let arpa_tx = radars.get_arpa_tx();
-        let common = CommonRadar::new(args, key, info, radars, control_update_rx, false, arpa_tx);
+        let common = CommonRadar::new(
+            args,
+            key.clone(),
+            info,
+            radars.clone(),
+            control_update_rx,
+            false,
+            arpa_tx,
+        );
 
         // Create the world simulation
         let mut world = EmulatorWorld::new(initial_pos);
@@ -122,10 +142,46 @@ impl EmulatorReportReceiver {
                 }
             });
 
+        let world = Arc::new(Mutex::new(world));
+        let boat_for_sampler = Arc::new(Mutex::new(initial_pos));
+        let receiver_for_sampler = Arc::new(Mutex::new(Receiver::default()));
+        let viewport_reach_m = spoke_range(*EMULATOR_RANGES.last().unwrap_or(&0) as u32) as f64;
+        {
+            let world_p = Arc::clone(&world);
+            let boat_p = Arc::clone(&boat_for_sampler);
+            let world_e = Arc::clone(&world);
+            let receiver_e = Arc::clone(&receiver_for_sampler);
+            let sampler = ViewportWorldSampler::new(
+                Arc::new(move || {
+                    let boat = *boat_p.lock().unwrap();
+                    let mut world = world_p.lock().unwrap();
+                    world.update_cache(&boat, VIEWPORT_WORLD_MIN_RADIUS_M, viewport_reach_m);
+                }),
+                Arc::new(move |bearing_deg, range_m| {
+                    let echo = {
+                        let world = world_e.lock().unwrap();
+                        world.get_echo(
+                            &GeoPosition::new(0.0, 0.0),
+                            bearing_deg * DEG_TO_RAD,
+                            range_m,
+                        )
+                    };
+                    let receiver = receiver_e.lock().unwrap();
+                    let pixel = (range_m / 2.0).max(0.0) as usize;
+                    receiver
+                        .pixel(echo, range_m, 0u16, pixel, 0u32)
+                        .intensity
+                }),
+            );
+            radars.set_viewport_world_sampler(&key, Some(sampler));
+        }
+
         EmulatorReportReceiver {
             common,
             command_sender,
+            radars,
             world,
+            boat_for_sampler,
             world_origin: initial_pos,
             coast: CoastView::new(coast),
             boat_position: initial_pos,
@@ -141,9 +197,18 @@ impl EmulatorReportReceiver {
             doppler_mode: DopplerMode::None,
             doppler_threshold: DEFAULT_DOPPLER_THRESHOLD,
             receiver: Receiver::default(),
+            receiver_for_sampler,
             last_update: Instant::now(),
             rotation_count: 0,
         }
+    }
+
+    fn sync_boat_for_sampler(&self) {
+        *self.boat_for_sampler.lock().unwrap() = self.boat_position;
+    }
+
+    fn sync_receiver_for_sampler(&self) {
+        *self.receiver_for_sampler.lock().unwrap() = self.receiver;
     }
 
     pub(super) async fn run(mut self, subsys: &mut SubsystemHandle) -> Result<(), RadarError> {
@@ -269,6 +334,7 @@ impl EmulatorReportReceiver {
                             ControlId::Sea => self.receiver.set_sea(value, cv.auto),
                             _ => self.receiver.set_rain(value, cv.auto),
                         }
+                        self.sync_receiver_for_sampler();
                         self.report_receiver();
                     }
                     Err(e) => {
@@ -306,7 +372,8 @@ impl EmulatorReportReceiver {
         }
 
         // Always update world (moving targets) even when boat is stationary
-        self.world.update(elapsed_secs);
+        self.world.lock().unwrap().update(elapsed_secs);
+        self.sync_boat_for_sampler();
     }
 
     /// Move the emulator's own boat along its course, turning it round at
@@ -368,7 +435,10 @@ impl EmulatorReportReceiver {
         let own_ship = crate::navdata::external_own_ship();
         if own_ship.is_some() != self.following {
             self.following = own_ship.is_some();
-            self.world.show_test_scenario(!self.following);
+            self.world
+                .lock()
+                .unwrap()
+                .show_test_scenario(!self.following);
             if self.following {
                 log::info!("Emulator: following own ship from the navigation source");
                 crate::navdata::withdraw_emulator_nav();
@@ -381,9 +451,13 @@ impl EmulatorReportReceiver {
         };
         (self.boat_position, self.boat_heading) = place_boat(own_ship, self.boat_heading);
         self.boat_turn = None;
+        self.sync_boat_for_sampler();
         if out_of_sight(&self.world_origin, &self.boat_position, self.current_range) {
             log::info!("Emulator: moving the test scenario to where the boat now is");
-            self.world.rebuild_around(self.boat_position);
+            self.world
+                .lock()
+                .unwrap()
+                .rebuild_around(self.boat_position);
             self.world_origin = self.boat_position;
             self.initial_lon = self.boat_position.lon();
         }
@@ -398,9 +472,10 @@ impl EmulatorReportReceiver {
         let heading_east = self.boat_heading > 0.0 && self.boat_heading < 180.0;
 
         if heading_west {
-            let visible = self
-                .world
-                .count_visible_targets(&self.boat_position, self.current_range as f64);
+            let visible = self.world.lock().unwrap().count_visible_targets(
+                &self.boat_position,
+                self.current_range as f64,
+            );
             if visible <= 2 {
                 log::info!(
                     "Emulator: only {} targets visible at range {}m, initiating turn",
@@ -443,7 +518,7 @@ impl EmulatorReportReceiver {
         });
 
         // All linear targets turn port (counterclockwise)
-        self.world.reverse_all_targets(TURN_RADIUS);
+        self.world.lock().unwrap().reverse_all_targets(TURN_RADIUS);
     }
 
     fn update_navdata(&self) {
@@ -468,13 +543,9 @@ impl EmulatorReportReceiver {
     /// Returns whether the batch finished a rotation.
     fn generate_spoke_batch(&mut self) -> bool {
         self.common.new_spoke_message();
+        self.sync_boat_for_sampler();
+        self.sync_receiver_for_sampler();
 
-        // Update the world's local coordinate cache once per batch
-        self.world.update_cache(
-            &self.boat_position,
-            meters_per_pixel(self.current_range) * MIN_ECHO_PIXELS,
-            spoke_range(self.current_range) as f64,
-        );
         let legend = self.common.info.get_legend();
         let doppler = DopplerColors::new(
             legend.doppler_approaching,
@@ -493,58 +564,60 @@ impl EmulatorReportReceiver {
         );
 
         let mut rotation_ended = false;
-        for _ in 0..SPOKES_PER_BATCH {
-            let spoke_data = self.generate_spoke(self.current_spoke, &doppler, &coast_echo);
-
-            // Heading in `EMULATOR_SPOKES`-units, matching the convention
-            // every brand's normalized `add_spoke` heading uses now.
-            let heading_spoke = ((self.boat_heading / 360.0) * EMULATOR_SPOKES as f64) as u16;
-
-            self.common.add_spoke(
-                spoke_range(self.current_range),
-                self.current_spoke,
-                Some(heading_spoke),
-                spoke_data,
+        {
+            let mut world = self.world.lock().unwrap();
+            // Update the world's local coordinate cache once per batch
+            world.update_cache(
+                &self.boat_position,
+                meters_per_pixel(self.current_range) * MIN_ECHO_PIXELS,
+                spoke_range(self.current_range) as f64,
             );
 
-            let new_spoke = next_spoke(self.current_spoke, self.spoke_step);
-            if new_spoke < self.current_spoke {
-                // Rotation wrapped - broadcast heading to ensure GUI receives it
-                self.rotation_count += 1;
-                rotation_ended = true;
-                self.refresh_ais();
-                if !self.following {
-                    crate::navdata::broadcast_heading(crate::navdata::EMULATOR_SOURCE);
+            for _ in 0..SPOKES_PER_BATCH {
+                let spoke_angle_deg =
+                    (self.current_spoke as f64 / EMULATOR_SPOKES as f64) * 360.0;
+                let world_bearing_rad = (self.boat_heading + spoke_angle_deg) * DEG_TO_RAD;
+                let spoke_data = Sweep {
+                    world: &*world,
+                    coast: &self.coast,
+                    coast_echo: &coast_echo,
+                    receiver: &self.receiver,
+                    doppler: &doppler,
+                    meters_per_pixel: meters_per_pixel(self.current_range),
+                    rotation: self.rotation_count,
                 }
+                .spoke(self.current_spoke, world_bearing_rad);
+
+                // Heading in `EMULATOR_SPOKES`-units, matching the convention
+                // every brand's normalized `add_spoke` heading uses now.
+                let heading_spoke =
+                    ((self.boat_heading / 360.0) * EMULATOR_SPOKES as f64) as u16;
+
+                self.common.add_spoke(
+                    spoke_range(self.current_range),
+                    self.current_spoke,
+                    Some(heading_spoke),
+                    spoke_data,
+                );
+
+                let new_spoke = next_spoke(self.current_spoke, self.spoke_step);
+                if new_spoke < self.current_spoke {
+                    // Rotation wrapped - broadcast heading to ensure GUI receives it
+                    self.rotation_count += 1;
+                    rotation_ended = true;
+                    if let Some(store) = crate::navdata::get_ais_store() {
+                        world.set_ais_vessels(&store.get_all_active());
+                    }
+                    if !self.following {
+                        crate::navdata::broadcast_heading(crate::navdata::EMULATOR_SOURCE);
+                    }
+                }
+                self.current_spoke = new_spoke;
             }
-            self.current_spoke = new_spoke;
         }
 
         self.common.send_spoke_message();
         rotation_ended
-    }
-
-    fn generate_spoke(
-        &self,
-        spoke_angle: u16,
-        doppler: &DopplerColors,
-        coast_echo: &CoastEcho,
-    ) -> GenericSpoke {
-        // Convert spoke angle to world bearing
-        // Spoke 0 = boat heading, increases clockwise
-        let spoke_angle_deg = (spoke_angle as f64 / EMULATOR_SPOKES as f64) * 360.0;
-        let world_bearing_rad = (self.boat_heading + spoke_angle_deg) * DEG_TO_RAD;
-
-        Sweep {
-            world: &self.world,
-            coast: &self.coast,
-            coast_echo,
-            receiver: &self.receiver,
-            doppler,
-            meters_per_pixel: meters_per_pixel(self.current_range),
-            rotation: self.rotation_count,
-        }
-        .spoke(spoke_angle, world_bearing_rad)
     }
 
     /// Report the gain, sea and rain settings the picture is drawn with
@@ -559,18 +632,17 @@ impl EmulatorReportReceiver {
             .set_value_auto(&ControlId::Rain, rain, rain_auto);
     }
 
-    /// Take the AIS vessels the navigation source reported since the last
-    /// rotation, so they echo where they now are.
-    fn refresh_ais(&mut self) {
-        if let Some(store) = crate::navdata::get_ais_store() {
-            self.world.set_ais_vessels(&store.get_all_active());
-        }
-    }
-
     /// Work out where the spokes cross land from where the boat now is.
     fn refresh_coast(&mut self) {
         self.coast
             .refresh(&self.boat_position, spoke_range(self.current_range) as f64);
+    }
+}
+
+impl Drop for EmulatorReportReceiver {
+    fn drop(&mut self) {
+        self.radars
+            .set_viewport_world_sampler(&self.common.key, None);
     }
 }
 

@@ -111,6 +111,15 @@ var showAis = (() => {
   }
 })();
 
+// LPS-style ARPA symbols (debug; default off)
+var showLpsSymbols = (() => {
+  try {
+    return localStorage.getItem("mayaraShowLpsSymbols") === "true";
+  } catch {
+    return false;
+  }
+})();
+
 // Active-route overlay enabled state (client-only toggle, persists in localStorage)
 var showRoute = (() => {
   try {
@@ -308,6 +317,9 @@ window.onload = async function () {
 
   // Create route lozenge (right of the AIS lozenge, toggles the active route)
   createRouteLozenge();
+
+  // LPS ARPA symbology debug (right of route lozenge)
+  createLpsSymbolsLozenge();
 
   // Create VRM/EBL lozenge (above AIS lozenge) - cycles through marker states
   createVrmEblLozenge();
@@ -1627,6 +1639,58 @@ function updateAisLozenge() {
   lozenge.title = noHeading
     ? "AIS unavailable — no heading source to position targets"
     : "Click to toggle AIS overlay";
+}
+
+// Debug: draw ARPA as LPS-style gold squares (symbology only).
+function createLpsSymbolsLozenge() {
+  const container = document.querySelector(".myr_ppi");
+  if (!container) return;
+
+  const lozenge = document.createElement("div");
+  lozenge.id = "myr_lps_lozenge";
+  lozenge.className =
+    "myr_lps_lozenge " + (showLpsSymbols ? "myr_lps_on" : "myr_lps_off");
+  lozenge.title = "Símbolos LPS (debug)";
+
+  const btn = document.createElement("button");
+  btn.className = "myr_lps_lozenge_button";
+  btn.setAttribute("aria-label", "Símbolos LPS");
+  // Gold square pictogram matching LPS radar target style
+  btn.innerHTML = `<svg class="myr_lps_icon" viewBox="0 0 24 24">
+    <rect x="6" y="6" width="12" height="12" rx="1"/>
+  </svg>`;
+  btn.addEventListener("click", toggleLpsSymbols);
+
+  lozenge.appendChild(btn);
+  container.appendChild(lozenge);
+
+  if (ppi) {
+    ppi.setShowLpsSymbols(showLpsSymbols);
+  }
+  updateLpsSymbolsLozenge();
+}
+
+function toggleLpsSymbols() {
+  showLpsSymbols = !showLpsSymbols;
+  try {
+    localStorage.setItem("mayaraShowLpsSymbols", String(showLpsSymbols));
+  } catch {
+    // ignore quota errors
+  }
+  if (ppi) {
+    ppi.setShowLpsSymbols(showLpsSymbols);
+  }
+  updateLpsSymbolsLozenge();
+}
+
+function updateLpsSymbolsLozenge() {
+  const lozenge = document.getElementById("myr_lps_lozenge");
+  if (!lozenge) return;
+  lozenge.classList.toggle("myr_lps_on", showLpsSymbols);
+  lozenge.classList.toggle("myr_lps_off", !showLpsSymbols);
+  lozenge.title = showLpsSymbols
+    ? "Símbolos LPS on (debug)"
+    : "Símbolos LPS (debug)";
 }
 
 function createRouteLozenge() {

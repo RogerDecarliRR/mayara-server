@@ -177,6 +177,10 @@ pub struct GeoEchoConfig {
     /// Cap on viewport PNG edge length; only 1024, 2048 or 4096.
     #[serde(default = "default_max_size_px")]
     pub max_size_px: u32,
+    /// Ceiling for viewport range-step snap (metres). `None` → use
+    /// [`Self::composition_range_m`] (default 14 NM).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_viewport_range_m: Option<f64>,
     /// Usable sector start bearing in degrees (North = 0, clockwise).
     #[serde(default = "default_usable_bearing_start_deg")]
     pub usable_bearing_start_deg: f64,
@@ -193,6 +197,7 @@ impl Default for GeoEchoConfig {
             echo_size_px: default_echo_size_px(),
             target_meters_per_px: default_target_meters_per_px(),
             max_size_px: default_max_size_px(),
+            max_viewport_range_m: None,
             usable_bearing_start_deg: default_usable_bearing_start_deg(),
             usable_bearing_end_deg: default_usable_bearing_end_deg(),
         }
@@ -200,6 +205,13 @@ impl Default for GeoEchoConfig {
 }
 
 impl GeoEchoConfig {
+    /// Range-step snap ceiling: explicit `max_viewport_range_m` or composition.
+    pub fn max_viewport_range_ceiling(&self) -> f64 {
+        self.max_viewport_range_m
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(self.composition_range_m)
+    }
+
     /// Clamp / repair values loaded from disk so the compositor always sees a
     /// usable window.
     pub fn normalized(mut self) -> Self {
@@ -217,9 +229,29 @@ impl GeoEchoConfig {
         if !GEO_ECHO_ALLOWED_SIZES.contains(&self.max_size_px) {
             self.max_size_px = default_max_size_px();
         }
+        if let Some(m) = self.max_viewport_range_m {
+            if !(GEO_ECHO_MIN_RANGE_M..=GEO_ECHO_MAX_RANGE_M).contains(&m) {
+                self.max_viewport_range_m = None;
+            }
+        }
         self.usable_bearing_start_deg = normalize_bearing_deg(self.usable_bearing_start_deg);
         self.usable_bearing_end_deg = normalize_bearing_end_deg(self.usable_bearing_end_deg);
         self
+    }
+
+    /// Guard zone 1 for Auto-ARPA acquisition: usable bearings × composition range.
+    ///
+    /// Angles are converted from degrees (N=0 CW) to radians; equal start/end
+    /// means a full circle (see blob detector). `enabled` is always true.
+    pub fn arpa_acquisition_guard_zone(&self) -> GuardZone {
+        let n = self.clone().normalized();
+        GuardZone {
+            start_angle: n.usable_bearing_start_deg.to_radians(),
+            end_angle: n.usable_bearing_end_deg.to_radians(),
+            start_distance: 0.0,
+            end_distance: n.composition_range_m,
+            enabled: true,
+        }
     }
 
     /// Validate a value coming from the API.
@@ -249,6 +281,14 @@ impl GeoEchoConfig {
                 "maxSizePx must be one of {:?}",
                 GEO_ECHO_ALLOWED_SIZES
             ));
+        }
+        if let Some(m) = self.max_viewport_range_m {
+            if !(GEO_ECHO_MIN_RANGE_M..=GEO_ECHO_MAX_RANGE_M).contains(&m) {
+                return Err(format!(
+                    "maxViewportRangeM must be between {} and {} metres",
+                    GEO_ECHO_MIN_RANGE_M, GEO_ECHO_MAX_RANGE_M
+                ));
+            }
         }
         if !bearing_in_closed_range(self.usable_bearing_start_deg) {
             return Err(
@@ -947,6 +987,28 @@ mod tests {
     }
 
     #[test]
+    fn arpa_acquisition_guard_zone_maps_deg_to_rad_and_composition_range() {
+        let cfg = GeoEchoConfig {
+            composition_range_m: 6.0 * 1852.0,
+            usable_bearing_start_deg: 45.0,
+            usable_bearing_end_deg: 135.0,
+            ..GeoEchoConfig::default()
+        };
+        let zone = cfg.arpa_acquisition_guard_zone();
+        assert!((zone.start_angle - 45.0_f64.to_radians()).abs() < 1e-12);
+        assert!((zone.end_angle - 135.0_f64.to_radians()).abs() < 1e-12);
+        assert_eq!(zone.start_distance, 0.0);
+        assert!((zone.end_distance - 6.0 * 1852.0).abs() < 1e-9);
+        assert!(zone.enabled);
+
+        let full = GeoEchoConfig::default().arpa_acquisition_guard_zone();
+        assert!((full.start_angle - 0.0).abs() < 1e-12);
+        assert!((full.end_angle - 360.0_f64.to_radians()).abs() < 1e-12);
+        assert!((full.end_distance - 14.0 * 1852.0).abs() < 1e-9);
+        assert!(full.enabled);
+    }
+
+    #[test]
     fn geo_echo_rejects_invalid_size_and_range() {
         assert!(
             GeoEchoConfig {
@@ -1000,12 +1062,22 @@ mod tests {
             echo_size_px: 1024,
             target_meters_per_px: 1.5,
             max_size_px: 4096,
+            max_viewport_range_m: Some(8.0 * 1852.0),
             usable_bearing_start_deg: 10.0,
             usable_bearing_end_deg: 350.0,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: GeoEchoConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cfg);
+        assert!(
+            (cfg.max_viewport_range_ceiling() - 8.0 * 1852.0).abs() < 1e-9
+        );
+        assert!(
+            (GeoEchoConfig::default().max_viewport_range_ceiling()
+                - default_composition_range_m())
+            .abs()
+                < 1e-9
+        );
     }
 
     #[test]

@@ -1030,6 +1030,9 @@ fn distinguishing_suffix_len(keys: &[&str]) -> usize {
 #[derive(Clone)]
 pub struct SharedRadars {
     radars: Arc<RwLock<Radars>>,
+    /// Optional geographic viewport samplers (emulator world), keyed by radar id.
+    /// When set, geo_echo viewport intensities come from the sampler — not GUI polar.
+    viewport_world_samplers: Arc<RwLock<HashMap<String, geo_echo::ViewportWorldSampler>>>,
 }
 
 impl Default for SharedRadars {
@@ -1050,7 +1053,38 @@ impl SharedRadars {
                 arpa_tx: None,
                 tracker_command_tx: None,
             })),
+            viewport_world_samplers: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Register (or clear) a geographic viewport echo sampler for `radar_id`.
+    pub fn set_viewport_world_sampler(
+        &self,
+        radar_id: &str,
+        sampler: Option<geo_echo::ViewportWorldSampler>,
+    ) {
+        let mut map = self.viewport_world_samplers.write().unwrap();
+        match sampler {
+            Some(s) => {
+                map.insert(radar_id.to_string(), s);
+            }
+            None => {
+                map.remove(radar_id);
+            }
+        }
+    }
+
+    /// Sampler used by geo_echo viewport when the brand supplies world data
+    /// independent of the GUI Range acquisition polar.
+    pub fn viewport_world_sampler(
+        &self,
+        radar_id: &str,
+    ) -> Option<geo_echo::ViewportWorldSampler> {
+        self.viewport_world_samplers
+            .read()
+            .unwrap()
+            .get(radar_id)
+            .cloned()
     }
 
     // A radar has been found
@@ -1122,15 +1156,46 @@ impl SharedRadars {
     }
 
     /// Persist and apply geo-echo composition settings (next published frame).
+    ///
+    /// Also syncs Guard Zone 1 on every active radar to the ARPA acquisition
+    /// zone derived from usable bearings × composition range, forces
+    /// `ControlId::Range` to `composition_range_m` (viewport and composition —
+    /// ARPA/blob horizon), and notifies the blob detector via the same
+    /// client-request path as the GUI.
     pub fn set_geo_echo_config(
         &self,
         cfg: crate::config::GeoEchoConfig,
     ) -> Result<crate::config::GeoEchoConfig, String> {
-        self.radars
-            .write()
-            .unwrap()
-            .persistent_data
-            .set_geo_echo(cfg)
+        let saved = {
+            let mut radars = self.radars.write().unwrap();
+            radars.persistent_data.set_geo_echo(cfg)?
+        };
+        let zone = saved.arpa_acquisition_guard_zone();
+        for mut info in self.get_active() {
+            info.controls
+                .set_guard_zone(&ControlId::GuardZone1, &zone);
+            let (reply_tx, _reply_rx) = mpsc::channel(1);
+            let mut cv = ControlValue::new(ControlId::GuardZone1, Value::from(zone.start_angle));
+            cv.end_value = Some(zone.end_angle);
+            cv.start_distance = Some(zone.start_distance);
+            cv.end_distance = Some(zone.end_distance);
+            cv.enabled = Some(zone.enabled);
+            if let Err(e) = info.controls.process_client_request(cv, reply_tx) {
+                log::debug!(
+                    "set_geo_echo_config: GZ1 notify skipped for {}: {e}",
+                    info.key()
+                );
+            }
+            // Acquisition Range = composition_range_m (same helper as compositor
+            // viewport/composition paths) so ARPA is not clipped by GUI zoom.
+            geo_echo::ensure_composition_radar_range(
+                self,
+                &info.key(),
+                saved.composition_range_m,
+            );
+            self.update(&mut info);
+        }
+        Ok(saved)
     }
 
     /// Store a change to a registered radar. Only the registration currently

@@ -285,6 +285,9 @@ class PPI {
     this.aisVessels = new Map();
     this.showAis = true; // Default to showing AIS vessels
 
+    // Debug: ARPA as LPS-style gold squares (symbology only; default off)
+    this.showLpsSymbols = false;
+
     // Active course to draw, from route.js coursePlot(); null when none
     this.coursePlot = null;
     this.showRoute = true;
@@ -830,6 +833,16 @@ class PPI {
     this.showAis = show;
     this.#drawOverlay();
     this.onTrackedChange?.();
+  }
+
+  /**
+   * Set whether ARPA targets use LPS-style gold squares (debug symbology).
+   * Acquisition / MARPA behaviour is unchanged.
+   * @param {boolean} show
+   */
+  setShowLpsSymbols(show) {
+    this.showLpsSymbols = !!show;
+    this.#drawOverlay();
   }
 
   /**
@@ -1715,10 +1728,30 @@ class PPI {
     const y = this.center_y - pixelDist * Math.cos(adjustedBearing);
 
     const dangerous = target.danger && isDangerous(target.danger.cpa, target.danger.tcpa);
+    const lps = this.showLpsSymbols;
+    // LPS night warning gold — readable on the dark PPI (symbology debug only)
+    const LPS_GOLD = "#e0a526";
 
     let color;
     let fillColor;
-    if (dangerous && target.status === "tracking") {
+    let dashed = false;
+    let symbolAlpha = 1;
+
+    if (lps) {
+      color = LPS_GOLD;
+      fillColor = "rgba(224, 165, 38, 0.35)";
+      if (dangerous && target.status === "tracking") {
+        color = "#ff4444";
+        fillColor = "rgba(224, 165, 38, 0.45)";
+      } else if (target.status === "acquiring") {
+        fillColor = "rgba(224, 165, 38, 0.18)";
+        dashed = true;
+      } else if (target.status === "lost") {
+        fillColor = "rgba(224, 165, 38, 0.1)";
+        dashed = true;
+        symbolAlpha = 0.65;
+      }
+    } else if (dangerous && target.status === "tracking") {
       color = "#ff0000"; // Red for dangerous
       fillColor = "rgba(255, 0, 0, 0.3)";
     } else {
@@ -1742,18 +1775,31 @@ class PPI {
     }
 
     ctx.save();
+    ctx.globalAlpha = symbolAlpha;
 
-    // Draw target symbol (small circle)
+    // Stock: 6px-radius circle. LPS debug: ~12px gold square.
     const targetRadius = 6;
 
-    // Filled circle
-    ctx.beginPath();
-    ctx.arc(x, y, targetRadius, 0, 2 * Math.PI);
-    ctx.fillStyle = fillColor;
-    ctx.fill();
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.stroke();
+    if (lps) {
+      const half = 6;
+      ctx.beginPath();
+      ctx.rect(x - half, y - half, half * 2, half * 2);
+      ctx.fillStyle = fillColor;
+      ctx.fill();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      if (dashed) ctx.setLineDash([3, 3]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    } else {
+      ctx.beginPath();
+      ctx.arc(x, y, targetRadius, 0, 2 * Math.PI);
+      ctx.fillStyle = fillColor;
+      ctx.fill();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+    }
 
     // Draw velocity vector if we have motion data
     if (target.motion && target.status === "tracking") {
@@ -1761,9 +1807,9 @@ class PPI {
       const courseRad = target.motion.course - heading + rot;
       const speed = target.motion.speed; // m/s
 
-      // Scale vector length: 1 minute of travel
+      // Scale vector length: 1 minute of travel (shorter cap in LPS debug)
       const vectorLength = speed * 60 * pixelsPerMeter;
-      const maxVectorLength = 100; // Cap at 100 pixels
+      const maxVectorLength = lps ? 60 : 100;
       const scaledLength = Math.min(vectorLength, maxVectorLength);
 
       if (scaledLength > 5) {
@@ -1778,7 +1824,7 @@ class PPI {
         ctx.stroke();
 
         // Arrowhead
-        const arrowSize = 6;
+        const arrowSize = lps ? 5 : 6;
         const arrowAngle = Math.atan2(vy - y, vx - x);
         ctx.beginPath();
         ctx.moveTo(vx, vy);
@@ -1794,6 +1840,8 @@ class PPI {
         ctx.stroke();
       }
     }
+
+    ctx.globalAlpha = 1;
 
     // Draw target ID label
     ctx.fillStyle = color;

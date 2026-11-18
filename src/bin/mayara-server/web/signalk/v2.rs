@@ -652,6 +652,10 @@ struct GeoEchoApi {
     target_meters_per_px: f64,
     #[schema(example = 2048)]
     max_size_px: u32,
+    /// Optional ceiling for viewport range-step snap (metres). Omit → compositionRangeM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = 25928.0)]
+    max_viewport_range_m: Option<f64>,
     #[schema(example = 0.0)]
     usable_bearing_start_deg: f64,
     #[schema(example = 360.0)]
@@ -666,6 +670,7 @@ impl From<&GeoEchoConfig> for GeoEchoApi {
             echo_size_px: cfg.echo_size_px,
             target_meters_per_px: cfg.target_meters_per_px,
             max_size_px: cfg.max_size_px,
+            max_viewport_range_m: cfg.max_viewport_range_m,
             usable_bearing_start_deg: cfg.usable_bearing_start_deg,
             usable_bearing_end_deg: cfg.usable_bearing_end_deg,
         }
@@ -680,6 +685,7 @@ impl From<GeoEchoApi> for GeoEchoConfig {
             echo_size_px: api.echo_size_px,
             target_meters_per_px: api.target_meters_per_px,
             max_size_px: api.max_size_px,
+            max_viewport_range_m: api.max_viewport_range_m,
             usable_bearing_start_deg: api.usable_bearing_start_deg,
             usable_bearing_end_deg: api.usable_bearing_end_deg,
         }
@@ -687,6 +693,8 @@ impl From<GeoEchoApi> for GeoEchoConfig {
 }
 
 /// Map bbox for a viewport echo render (lon/lat).
+/// Optional `radarLat`/`radarLon` place the antenna (asset site) when the
+/// polar buffer still carries another datum (e.g. emulator at Sneek).
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct ViewportRequest {
@@ -694,6 +702,12 @@ struct ViewportRequest {
     south: f64,
     east: f64,
     north: f64,
+    /// Antenna latitude (WGS84). When set with `radarLon`, overrides polar centre.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    radar_lat: Option<f64>,
+    /// Antenna longitude (WGS84). When set with `radarLat`, overrides polar centre.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    radar_lon: Option<f64>,
 }
 
 /// Viewport render result — same shape as `echo.json` plus PNG path and scale.
@@ -728,9 +742,11 @@ async fn get_geo_echo(State(state): State<Web>) -> Response {
     put,
     path = "/signalk/v2/api/geo-echo",
     summary = "Update geo echo settings",
-    description = "Persists mode, compositionRangeM (50 m … 120 NM), echoSizePx / maxSizePx \
-                   (1024 | 2048 | 4096), targetMetersPerPx, and usable bearing sector \
-                   (0…360°, North=0 clockwise; wraps when start>end).",
+    description = "Persists mode, compositionRangeM (50 m … 120 NM), optional \
+                   maxViewportRangeM (viewport range-step snap ceiling; default = \
+                   compositionRangeM), echoSizePx / maxSizePx (1024 | 2048 | 4096), \
+                   targetMetersPerPx, and usable bearing sector (0…360°, North=0 \
+                   clockwise; wraps when start>end).",
     request_body(content = GeoEchoApi, example = json!({
         "mode": "viewport",
         "compositionRangeM": 25928.0,
@@ -840,10 +856,14 @@ async fn get_echo_png(Path(radar_id): Path<String>, State(state): State<Web>) ->
     post,
     path = "/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport",
     summary = "Render geo echo for a map viewport",
-    description = "Projects the latest polar buffer into a north-up PNG covering the \
-                   requested bbox (lon/lat). Size = min(maxSizePx, ceil(max(spanEW, spanNS) / \
-                   targetMetersPerPx)). Bearing mask from geo-echo config applies. \
-                   Returns metadata; fetch PNG at `pngPath` (`…/echo/viewport.png`).",
+    description = "Inverse-samples the latest polar into a north-up PNG for the annular \
+                   sector of the requested bbox about the antenna (optional \
+                   `radarLat`/`radarLon` overrides polar centre). Paint resolution snaps \
+                   the bbox diagonal up to a Mayara range step (ceiling: maxViewportRangeM \
+                   or compositionRangeM); GUI Range/centre/zoom do not affect the image. \
+                   Size = min(maxSizePx, ceil(max(spanEW, spanNS) / targetMetersPerPx)). \
+                   Usable bearing mask from geo-echo config applies. Returns metadata; \
+                   fetch PNG at `pngPath` (`…/echo/viewport.png`).",
     params(
         ("radar_id" = String, Path, description = "Radar identifier", example = "emu0")
     ),
@@ -851,7 +871,9 @@ async fn get_echo_png(Path(radar_id): Path<String>, State(state): State<Web>) ->
         "west": -40.08,
         "south": -19.87,
         "east": -40.04,
-        "north": -19.83
+        "north": -19.83,
+        "radarLat": -19.85,
+        "radarLon": -40.06
     })),
     responses(
         (status = 200, body = ViewportResponse, description = "Viewport frame metadata + pngPath"),
@@ -874,7 +896,17 @@ async fn post_echo_viewport(
         east: request.east,
         north: request.north,
     };
-    match geo_echo::publish_viewport(&state.radars, &radar_id, bbox) {
+    let site = match (request.radar_lat, request.radar_lon) {
+        (Some(lat), Some(lon)) => Some((lat, lon)),
+        (None, None) => None,
+        _ => {
+            return SignalKResponse::failed(
+                StatusCode::BAD_REQUEST,
+                "radarLat and radarLon must both be set or both omitted",
+            );
+        }
+    };
+    match geo_echo::publish_viewport(&state.radars, &radar_id, bbox, site) {
         Ok(meta) => {
             let (span_ew, span_ns) = bbox.spans_m();
             let span = span_ew.max(span_ns).max(1e-6);

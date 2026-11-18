@@ -1,4 +1,3 @@
-use std::f64::consts::PI;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use tokio_graceful_shutdown::{SubsystemBuilder, SubsystemHandle};
@@ -165,35 +164,29 @@ pub(crate) fn create_emulator_radar(args: &Cli, radars: &SharedRadars, subsys: &
         let ranges = crate::radar::range::Ranges::new_by_distance(EMULATOR_RANGES);
         info.set_ranges(ranges);
 
-        // Set a default guard zone for testing if none was loaded from persistence
-        // Covers the rear starboard quadrant: -135° to -45° relative to heading (225° to 315°)
-        if info.controls.guard_zone(&ControlId::GuardZone1).is_none() {
-            let guard_zone = GuardZone {
-                start_angle: 225.0 * PI / 180.0,
-                end_angle: 315.0 * PI / 180.0,
-                start_distance: 300.0,
-                end_distance: 700.0,
-                enabled: true,
-            };
-            info.controls
-                .set_guard_zone(&ControlId::GuardZone1, &guard_zone);
-            log::info!("Emulator: Set default guard zone 1 for ARPA testing");
-        }
+        // Always align GZ1 to geo-echo usable sector × composition range so
+        // Auto-ARPA acquires even when persistence left a disabled zone.
+        let gz1 = radars.geo_echo_config().arpa_acquisition_guard_zone();
+        info.controls
+            .set_guard_zone(&ControlId::GuardZone1, &gz1);
+        log::info!(
+            "Emulator: Guard zone 1 from geo-echo ({:.0}–{:.0} deg, 0–{:.0} m)",
+            gz1.start_angle.to_degrees(),
+            gz1.end_angle.to_degrees(),
+            gz1.end_distance
+        );
 
-        // Set guard zone 2 to catch fast eastbound targets (40 knots, 300m north)
-        // Covers northwest quadrant: 270° to 360° (west to north) to catch them as they appear
-        if info.controls.guard_zone(&ControlId::GuardZone2).is_none() {
-            let guard_zone = GuardZone {
-                start_angle: 270.0 * PI / 180.0,
-                end_angle: 360.0 * PI / 180.0,
-                start_distance: 200.0,
-                end_distance: 500.0,
-                enabled: true,
-            };
-            info.controls
-                .set_guard_zone(&ControlId::GuardZone2, &guard_zone);
-            log::info!("Emulator: Set default guard zone 2 for fast target testing");
-        }
+        // One acquisition zone is enough; keep GZ2 present but disabled.
+        info.controls.set_guard_zone(
+            &ControlId::GuardZone2,
+            &GuardZone {
+                start_angle: 0.0,
+                end_angle: 0.0,
+                start_distance: 0.0,
+                end_distance: 0.0,
+                enabled: false,
+            },
+        );
 
         radars.update(&mut info);
 
