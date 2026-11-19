@@ -16,6 +16,7 @@ use super::{
     EMULATOR_RANGES, EMULATOR_SPOKE_LEN, EMULATOR_SPOKES, get_initial_position, spoke_step,
 };
 use crate::Cli;
+use crate::radar::geo_arpa::MonitorContactEnumerator;
 use crate::radar::geo_echo::ViewportWorldSampler;
 use crate::radar::settings::{ControlId, ControlUpdate};
 use crate::radar::spoke::GenericSpoke;
@@ -174,6 +175,21 @@ impl EmulatorReportReceiver {
                 }),
             );
             radars.set_viewport_world_sampler(&key, Some(sampler));
+        }
+        {
+            let world_list = Arc::clone(&world);
+            let boat_list = Arc::clone(&boat_for_sampler);
+            let enumerator = MonitorContactEnumerator::new(Arc::new(move |boat, max_range_m| {
+                // Prefer caller boat (nav); fall back to live emulator pose.
+                let boat = if boat.lat().abs() > 1e-12 || boat.lon().abs() > 1e-12 {
+                    boat
+                } else {
+                    *boat_list.lock().unwrap()
+                };
+                let world = world_list.lock().unwrap();
+                world.list_monitor_contacts(&boat, max_range_m)
+            }));
+            radars.set_monitor_contact_enumerator(&key, Some(enumerator));
         }
 
         EmulatorReportReceiver {

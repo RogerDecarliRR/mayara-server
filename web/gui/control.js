@@ -39,6 +39,8 @@ import {
   isStandaloneMode,
   isPlaybackRadar,
   wsBase,
+  apiBase,
+  apiFetch,
 } from "./api.js";
 import { setZoneEditMode, setZoneCreateMode, setRectCreateMode, setSectorEditMode, updateZoneForEditing, updateRectForEditing } from "./viewer.js";
 import { SpokeProcessingMode } from "./spoke_processor.js";

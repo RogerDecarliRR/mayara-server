@@ -1,9 +1,31 @@
 use std::collections::HashMap;
 use std::f64::consts::{PI, TAU};
 
+use std::hash::{Hash, Hasher};
+
 use super::marks::Mark;
 use crate::ais::AisVesselApi;
+use crate::radar::geo_arpa::MonitorContact;
 use crate::radar::{GeoPosition, KN_TO_MS};
+
+/// Stable id namespaces for [`EmulatorWorld::list_monitor_contacts`].
+const NS_TARGET: u64 = 0x01;
+const NS_CROSSING: u64 = 0x02;
+const NS_FAST: u64 = 0x03;
+const NS_CIRCLING: u64 = 0x04;
+const NS_AIS: u64 = 0x05;
+
+fn stable_contact_id(namespace: u64, key: u64) -> u64 {
+    (namespace << 56) | (key & 0x00FF_FFFF_FFFF_FFFF)
+}
+
+fn ais_contact_key(mmsi: &str) -> u64 {
+    mmsi.parse::<u64>().unwrap_or_else(|_| {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        mmsi.hash(&mut hasher);
+        hasher.finish()
+    })
+}
 
 // Constants for east-moving targets simulation
 const TARGET_SPEED_KNOTS: f64 = 5.0;
@@ -602,7 +624,8 @@ impl EmulatorWorld {
         // Circling target keeps circling, buoys are static
     }
 
-    /// Count how many targets are within the given range of the boat
+    /// Count how many scenario boats are within the given range of the boat
+    /// (turn-trigger helper; does not count AIS).
     pub(crate) fn count_visible_targets(&self, boat_pos: &GeoPosition, max_range: f64) -> usize {
         let max_range_sq = max_range * max_range;
         let meters_per_degree_lat: f64 = 111_320.0;
@@ -635,6 +658,99 @@ impl EmulatorWorld {
             count += 1;
         }
         count
+    }
+
+    /// Mobile contacts for the monitor ARPA feed (`geo-arpa`), within `max_range_m`.
+    ///
+    /// Includes test-scenario boats (east / crossing / fast / circling) when the
+    /// scenario is shown, plus AIS vessels. Excludes static buoys and chart marks.
+    /// IDs are deterministic across polls (`namespace << 56 | index|MMSI`).
+    pub(crate) fn list_monitor_contacts(
+        &self,
+        boat_pos: &GeoPosition,
+        max_range_m: f64,
+    ) -> Vec<MonitorContact> {
+        let max_range_sq = max_range_m * max_range_m;
+        let meters_per_degree_lat: f64 = 111_320.0;
+        let lat_rad = boat_pos.lat().to_radians();
+        let meters_per_degree_lon = meters_per_degree_lat * lat_rad.cos();
+
+        let in_range = |pos: &GeoPosition| -> bool {
+            let dx = (pos.lon() - boat_pos.lon()) * meters_per_degree_lon;
+            let dy = (pos.lat() - boat_pos.lat()) * meters_per_degree_lat;
+            dx * dx + dy * dy <= max_range_sq
+        };
+
+        let mut out = Vec::new();
+        let push = |out: &mut Vec<MonitorContact>,
+                    id: u64,
+                    pos: GeoPosition,
+                    heading_deg: f64,
+                    speed_m_s: f64| {
+            if !in_range(&pos) {
+                return;
+            }
+            let (distance_m, bearing_rad) = distance_and_bearing(boat_pos, &pos);
+            out.push(MonitorContact {
+                id,
+                position: pos,
+                bearing_rad,
+                distance_m,
+                heading_deg,
+                speed_m_s,
+            });
+        };
+
+        if self.test_scenario {
+            for (i, t) in self.targets.iter().enumerate() {
+                push(
+                    &mut out,
+                    stable_contact_id(NS_TARGET, i as u64),
+                    t.position,
+                    t.heading,
+                    t.speed,
+                );
+            }
+            for (i, t) in self.crossing_targets.iter().enumerate() {
+                push(
+                    &mut out,
+                    stable_contact_id(NS_CROSSING, i as u64),
+                    t.position,
+                    t.heading,
+                    t.speed,
+                );
+            }
+            for (i, t) in self.fast_targets.iter().enumerate() {
+                push(
+                    &mut out,
+                    stable_contact_id(NS_FAST, i as u64),
+                    t.position,
+                    t.heading,
+                    t.speed,
+                );
+            }
+            let speed_m_s =
+                self.circling_target.angular_velocity * self.circling_target.radius;
+            push(
+                &mut out,
+                stable_contact_id(NS_CIRCLING, 0),
+                self.circling_target.position,
+                self.circling_target.heading,
+                speed_m_s,
+            );
+        }
+
+        for echo in &self.ais {
+            push(
+                &mut out,
+                stable_contact_id(NS_AIS, ais_contact_key(&echo.mmsi)),
+                echo.target.position,
+                echo.target.heading,
+                echo.target.speed,
+            );
+        }
+
+        out
     }
 
     /// Update the local coordinate cache for the current boat position
@@ -1199,5 +1315,45 @@ mod tests {
         let dist = distance_between(&p1, &p2);
         // At 53N, 0.01 degrees longitude is about 670m
         assert!(dist > 600.0 && dist < 700.0);
+    }
+
+    #[test]
+    fn list_monitor_contacts_respects_max_range() {
+        let boat = GeoPosition::new(OWN_SHIP.0, OWN_SHIP.1);
+        let world = EmulatorWorld::new(boat);
+        let near = world.list_monitor_contacts(&boat, 800.0);
+        let wide = world.list_monitor_contacts(&boat, 50_000.0);
+        assert!(!near.is_empty());
+        assert!(wide.len() > near.len());
+        // Stable ids across polls
+        let again = world.list_monitor_contacts(&boat, 800.0);
+        let mut a: Vec<_> = near.iter().map(|c| c.id).collect();
+        let mut b: Vec<_> = again.iter().map(|c| c.id).collect();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn list_monitor_contacts_excludes_buoys_and_hidden_scenario() {
+        let boat = GeoPosition::new(OWN_SHIP.0, OWN_SHIP.1);
+        let mut world = EmulatorWorld::new(boat);
+        let with_scenario = world.list_monitor_contacts(&boat, 50_000.0).len();
+        world.show_test_scenario(false);
+        let hidden = world.list_monitor_contacts(&boat, 50_000.0);
+        assert!(with_scenario > 0);
+        assert!(hidden.is_empty());
+    }
+
+    #[test]
+    fn list_monitor_contact_ids_use_namespaces() {
+        let boat = GeoPosition::new(OWN_SHIP.0, OWN_SHIP.1);
+        let world = EmulatorWorld::new(boat);
+        let contacts = world.list_monitor_contacts(&boat, 50_000.0);
+        let ns = |id: u64| id >> 56;
+        assert!(contacts.iter().any(|c| ns(c.id) == NS_TARGET));
+        assert!(contacts.iter().any(|c| ns(c.id) == NS_CROSSING));
+        assert!(contacts.iter().any(|c| ns(c.id) == NS_FAST));
+        assert!(contacts.iter().any(|c| ns(c.id) == NS_CIRCLING));
     }
 }

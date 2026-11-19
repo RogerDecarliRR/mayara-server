@@ -25,6 +25,7 @@ use utoipa::ToSchema;
 
 pub mod cpa;
 pub mod exclusion;
+pub mod geo_arpa;
 pub mod geo_echo;
 pub mod range;
 pub mod settings;
@@ -1033,6 +1034,9 @@ pub struct SharedRadars {
     /// Optional geographic viewport samplers (emulator world), keyed by radar id.
     /// When set, geo_echo viewport intensities come from the sampler — not GUI polar.
     viewport_world_samplers: Arc<RwLock<HashMap<String, geo_echo::ViewportWorldSampler>>>,
+    /// Optional monitor-ARPA contact enumerators (emulator world), keyed by radar id.
+    monitor_contact_enumerators:
+        Arc<RwLock<HashMap<String, geo_arpa::MonitorContactEnumerator>>>,
 }
 
 impl Default for SharedRadars {
@@ -1054,6 +1058,7 @@ impl SharedRadars {
                 tracker_command_tx: None,
             })),
             viewport_world_samplers: Arc::new(RwLock::new(HashMap::new())),
+            monitor_contact_enumerators: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -1081,6 +1086,36 @@ impl SharedRadars {
         radar_id: &str,
     ) -> Option<geo_echo::ViewportWorldSampler> {
         self.viewport_world_samplers
+            .read()
+            .unwrap()
+            .get(radar_id)
+            .cloned()
+    }
+
+    /// Register (or clear) a monitor-ARPA contact enumerator for `radar_id`.
+    pub fn set_monitor_contact_enumerator(
+        &self,
+        radar_id: &str,
+        enumerator: Option<geo_arpa::MonitorContactEnumerator>,
+    ) {
+        let mut map = self.monitor_contact_enumerators.write().unwrap();
+        match enumerator {
+            Some(e) => {
+                map.insert(radar_id.to_string(), e);
+            }
+            None => {
+                map.remove(radar_id);
+            }
+        }
+    }
+
+    /// Enumerator used by `geo_arpa` when the brand supplies world contacts
+    /// independent of GUI Range / blob tracker.
+    pub fn monitor_contact_enumerator(
+        &self,
+        radar_id: &str,
+    ) -> Option<geo_arpa::MonitorContactEnumerator> {
+        self.monitor_contact_enumerators
             .read()
             .unwrap()
             .get(radar_id)
@@ -1158,10 +1193,8 @@ impl SharedRadars {
     /// Persist and apply geo-echo composition settings (next published frame).
     ///
     /// Also syncs Guard Zone 1 on every active radar to the ARPA acquisition
-    /// zone derived from usable bearings × composition range, forces
-    /// `ControlId::Range` to `composition_range_m` (viewport and composition —
-    /// ARPA/blob horizon), and notifies the blob detector via the same
-    /// client-request path as the GUI.
+    /// zone (usable bearings × composition range). Does **not** write
+    /// `ControlId::Range` — GUI zoom stays independent of composition.
     pub fn set_geo_echo_config(
         &self,
         cfg: crate::config::GeoEchoConfig,
@@ -1186,13 +1219,6 @@ impl SharedRadars {
                     info.key()
                 );
             }
-            // Acquisition Range = composition_range_m (same helper as compositor
-            // viewport/composition paths) so ARPA is not clipped by GUI zoom.
-            geo_echo::ensure_composition_radar_range(
-                self,
-                &info.key(),
-                saved.composition_range_m,
-            );
             self.update(&mut info);
         }
         Ok(saved)

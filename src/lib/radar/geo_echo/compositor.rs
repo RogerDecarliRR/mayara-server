@@ -1,6 +1,6 @@
 //! Subscribes to radar spokes and publishes a north-up geo echo frame.
 
-use super::super::settings::{ControlId, ControlValue};
+use super::super::settings::ControlId;
 use super::super::{Legend, RadarInfo, SharedRadars};
 use super::corners::{corners_for, refresh_interval_ms};
 use super::frame::{now_unix_ms, Center, EchoFrame, EchoMeta, SizePx};
@@ -21,9 +21,6 @@ use protobuf::Message;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use tokio::sync::broadcast;
-
-/// Metres: treat Range as already aligned when within this of the snapped target.
-const RANGE_ALIGN_EPS_M: f64 = 0.5;
 
 /// Latest polar snapshot for on-demand viewport renders.
 #[derive(Clone)]
@@ -148,10 +145,6 @@ pub fn publish_viewport(
         .clone();
 
     let geo = radars.geo_echo_config();
-    // Acquisition horizon (ARPA/blob): spokes only exist out to Control Range.
-    // Keep Range on composition_range_m in viewport mode too — map zoom must
-    // not shrink the detector's horizon (PNG pitch still uses view_step snap).
-    ensure_composition_radar_range(radars, radar_id, geo.composition_range_m);
 
     let (span_ew, span_ns) = bbox.spans_m();
     // Snap metric = half of the smaller span (not diagonal — that over-snapped).
@@ -202,10 +195,8 @@ pub fn publish_viewport(
         return Ok(cold.meta);
     };
 
-    // Annular inverse-sample at snapped view_step. Range is forced above for
-    // ARPA acquisition; PNG pitch still follows view_step. Emulator / world
-    // sampler fills intensities from geography — same bbox+asset ⇒ same PNG
-    // regardless of the operator's previous Range dial.
+    // Annular inverse-sample at snapped view_step. PNG pitch follows view_step;
+    // operator Control Range is independent of composition coverage.
     let world = radars.viewport_world_sampler(radar_id);
     let rgba = if let Some(ref sampler) = world {
         sampler.prepare();
@@ -444,72 +435,6 @@ fn resolve_spoke_range_m(radars: &SharedRadars, key: &str, polar: &PolarBuffer) 
     0.0
 }
 
-/// Nearest settable Range (metres) for `target_m`, or `target_m` if unconstrained.
-/// Mirrors `Control::snap_to_valid_value` so composition align matches the GUI path.
-pub(crate) fn nearest_valid_range_m(valid: Option<&[i32]>, target_m: f64) -> f64 {
-    let Some(valid) = valid else {
-        return target_m;
-    };
-    valid
-        .iter()
-        .min_by(|a, b| {
-            let da = (**a as f64 - target_m).abs();
-            let db = (**b as f64 - target_m).abs();
-            da.total_cmp(&db).then(a.cmp(b))
-        })
-        .map(|v| *v as f64)
-        .unwrap_or(target_m)
-}
-
-fn range_needs_align(current_m: Option<f64>, desired_m: f64) -> bool {
-    match current_m {
-        Some(v) => (v - desired_m).abs() > RANGE_ALIGN_EPS_M,
-        None => true,
-    }
-}
-
-/// Keep radar `ControlId::Range` on `composition_range_m` whenever geo-echo is
-/// active (composition **and** viewport).
-///
-/// ARPA / blob acquisition only sees spokes out to the GUI Control Range; if
-/// viewport left Range on the operator zoom, detection would be clipped short
-/// of the configured horizon. Composition also needs full-disk spoke cover
-/// (`scale ≈ spoke_range/composition`). Viewport PNG pitch still uses the
-/// annular `view_step` snap — this only widens hardware/emulator acquisition.
-pub(crate) fn ensure_composition_radar_range(
-    radars: &SharedRadars,
-    key: &str,
-    composition_range_m: f64,
-) {
-    if composition_range_m <= 0.0 {
-        return;
-    }
-    let Some(info) = radars.get_by_key(key) else {
-        return;
-    };
-    let Some(control) = info.controls.get(&ControlId::Range) else {
-        return;
-    };
-    let desired_m = nearest_valid_range_m(
-        control.item().valid_values.as_deref(),
-        composition_range_m,
-    );
-    let current_m = control.value().and_then(|v| v.as_f64());
-    if !range_needs_align(current_m, desired_m) {
-        return;
-    }
-    // Same path the GUI uses: snap + Command destination → brand set_control.
-    let (reply_tx, _reply_rx) = tokio::sync::mpsc::channel(1);
-    let cv = ControlValue::new(ControlId::Range, composition_range_m.into());
-    match info.controls.process_client_request(cv, reply_tx) {
-        Ok(()) => debug!(
-            "geo_echo {key}: forced Range → {desired_m:.0} m (was {:?}; acquisition=composition_range_m)",
-            current_m
-        ),
-        Err(e) => debug!("geo_echo {key}: Range align skipped: {e}"),
-    }
-}
-
 fn store_snapshot(
     snapshot: &Arc<RwLock<PolarSnapshot>>,
     polar: &PolarBuffer,
@@ -544,10 +469,6 @@ fn publish_frame(
     let composition_range_m = geo.composition_range_m;
     let size_px = geo.echo_size_px;
     let refresh = refresh_interval_ms(clock.period_ms());
-
-    // Both modes: align GUI/hardware Range to compositionRangeM so spokes
-    // (and ARPA/blob) cover the configured horizon, not the operator zoom.
-    ensure_composition_radar_range(radars, key, composition_range_m);
 
     let spoke_range_m = resolve_spoke_range_m(radars, key, polar);
 
@@ -624,30 +545,7 @@ pub(crate) fn resolve_viewport_site(
 
 #[cfg(test)]
 mod tests {
-    use super::{nearest_valid_range_m, range_needs_align, resolve_viewport_site};
-
-    #[test]
-    fn nearest_valid_range_picks_closest_settable() {
-        let valid = [7408, 11112, 14816, 25928];
-        assert_eq!(nearest_valid_range_m(Some(&valid), 14.0 * 1852.0), 25928.0);
-        assert_eq!(nearest_valid_range_m(Some(&valid), 9888.0), 11112.0);
-        assert_eq!(nearest_valid_range_m(None, 1234.0), 1234.0);
-    }
-
-    /// Viewport + ARPA share the same acquisition horizon: composition_range_m
-    /// (snapped to a settable Range). Operator zoom (e.g. 1 NM) must still
-    /// realign — otherwise blob/ARPA only sees spokes inside the GUI zoom.
-    #[test]
-    fn range_align_skips_when_already_on_composition() {
-        let composition_horizon_m = 25928.0; // ~14 NM settable
-        assert!(!range_needs_align(
-            Some(composition_horizon_m),
-            composition_horizon_m
-        ));
-        // Viewport zoom at 1 NM must still force Range up to composition.
-        assert!(range_needs_align(Some(1852.0), composition_horizon_m));
-        assert!(range_needs_align(None, composition_horizon_m));
-    }
+    use super::resolve_viewport_site;
 
     #[test]
     fn viewport_site_overrides_polar_center() {

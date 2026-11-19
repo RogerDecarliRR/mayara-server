@@ -34,6 +34,7 @@ use mayara::{
     navdata,
     radar::{
         GeoPosition, Legend, RadarError, RadarInfo, SharedRadars,
+        geo_arpa::{self, GeoArpaMeta, GeoArpaTarget},
         geo_echo::{self, Center, EchoCorners, EchoMeta, LonLat, SizePx, BBox},
         settings::{BareControlValue, Control, ControlId, ControlValue, RadarControlValue},
         target::{ArpaTargetApi, MarpaRequest, TrackerCommand},
@@ -66,6 +67,8 @@ const RADAR_ECHO_VIEWPORT_URI: &str =
     "/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport";
 const RADAR_ECHO_VIEWPORT_PNG_URI: &str =
     "/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport.png";
+const RADAR_GEO_ARPA_URI: &str =
+    "/signalk/v2/api/vessels/self/radars/{radar_id}/geo-arpa.json";
 const GEO_ECHO_URI: &str = "/signalk/v2/api/geo-echo";
 
 /// How long a control PUT waits for the radar to object before it reports
@@ -111,6 +114,7 @@ const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
         get_echo_png,
         post_echo_viewport,
         get_echo_viewport_png,
+        get_geo_arpa,
         get_geo_echo,
         set_geo_echo,
     ),
@@ -133,6 +137,8 @@ const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
         ArpaTargetApi,
         AcquireTargetRequest,
         AcquireTargetResponse,
+        GeoArpaMeta,
+        GeoArpaTarget,
         // WebSocket message types
         SignalKDelta,
         Subscription,
@@ -176,6 +182,7 @@ pub(crate) fn routes(axum: axum::Router<Web>) -> axum::Router<Web> {
         .route(RADAR_ECHO_PNG_URI, get(get_echo_png))
         .route(RADAR_ECHO_VIEWPORT_URI, axum::routing::post(post_echo_viewport))
         .route(RADAR_ECHO_VIEWPORT_PNG_URI, get(get_echo_viewport_png))
+        .route(RADAR_GEO_ARPA_URI, get(get_geo_arpa))
         .route(ROUTE_URI, get(get_route))
         .route(OPENAPI_URI, get(openapi_json))
         .merge(SwaggerUi::new("/swagger-ui").config(SwaggerConfig::new([OPENAPI_URI])))
@@ -819,6 +826,29 @@ async fn get_echo_json(Path(radar_id): Path<String>, State(state): State<Web>) -
         .map(|f| f.meta.clone())
         .unwrap_or_else(|_| geo_echo::EchoFrame::unavailable().meta);
     Json(meta).into_response()
+}
+
+#[utoipa::path(
+    get,
+    path = "/signalk/v2/api/vessels/self/radars/{radar_id}/geo-arpa.json",
+    summary = "Monitor ARPA contacts (composition coverage)",
+    description = "Mobile contacts within geo-echo compositionRangeM × usable bearings. \
+                   Independent of GUI Control Range and GET …/targets. Without a brand \
+                   enumerator (e.g. non-emulator), `available` is false and `targets` is empty.",
+    params(
+        ("radar_id" = String, Path, description = "Radar identifier", example = "emu0")
+    ),
+    responses(
+        (status = 200, body = GeoArpaMeta, description = "Monitor ARPA payload"),
+        (status = 404, description = "Radar not found")
+    ),
+    tag = "Targets"
+)]
+async fn get_geo_arpa(Path(radar_id): Path<String>, State(state): State<Web>) -> Response {
+    if state.radars.get_by_key(&radar_id).is_none() {
+        return no_such_radar(&radar_id, &state.radars);
+    }
+    Json(geo_arpa::publish_geo_arpa(&state.radars, &radar_id)).into_response()
 }
 
 #[utoipa::path(

@@ -117,8 +117,8 @@ pub(crate) struct TelemetryConfig {
     pub consent: Option<bool>,
 }
 
-/// Fixed composition window for the north-up geo echo overlay (independent of
-/// the radar Control Range).
+/// Fixed composition window for the north-up geo echo overlay (and geo-arpa
+/// monitor coverage). Independent of the operator's `ControlId::Range`.
 pub const GEO_ECHO_MIN_RANGE_M: f64 = 50.0;
 pub const GEO_ECHO_MAX_RANGE_M: f64 = 120.0 * 1852.0;
 pub const GEO_ECHO_ALLOWED_SIZES: &[u32] = &[1024, 2048, 4096];
@@ -166,6 +166,7 @@ pub struct GeoEchoConfig {
     #[serde(default)]
     pub mode: GeoEchoMode,
     /// Half-side of the composition square in metres (image edge to centre).
+    /// Also the physical acquisition Range (dual-stream); GUI zoom is separate.
     #[serde(default = "default_composition_range_m")]
     pub composition_range_m: f64,
     /// PNG edge length in pixels for composition mode; only 1024, 2048 or 4096.
