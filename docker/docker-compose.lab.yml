@@ -1,4 +1,4 @@
-# Lab local imevts: imagem mayara-server:local (--emulator) na 6502.
+# Lab local imevts: imagem mayara-server:local (--emulator) na 6502 + geo-echo-renderer na 6503.
 # Subir: ../scripts/dev/up-local.sh
 # FK-1 smoke: só --emulator (cenário embutido HALO). static-position porto só com land/marks ou RM-124.
 services:
@@ -14,6 +14,10 @@ services:
     command: ["mayara-server", "--emulator"]
     ports:
       - "${MAYARA_HOST_PORT:-6502}:6502"
+    environment:
+      GEO_ECHO_RENDERER_URL: http://geo-echo-renderer:6503
+    networks:
+      - mayara-lab
     tmpfs:
       - /home/mayara/.config/mayara
       - /home/mayara/.local/share/mayara
@@ -24,3 +28,31 @@ services:
     cap_drop:
       - ALL
     restart: unless-stopped
+
+  geo-echo-renderer:
+    container_name: mayara-geo-echo-renderer
+    image: mayara-server:local
+    command: ["geo-echo-renderer"]
+    ports:
+      - "${MAYARA_GEO_ECHO_HOST_PORT:-6503}:6503"
+    networks:
+      - mayara-lab
+    tmpfs:
+      - /tmp
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # Override image HEALTHCHECK (signalk :6502) — this process only serves :6503.
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:6503/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+networks:
+  mayara-lab:
+    driver: bridge

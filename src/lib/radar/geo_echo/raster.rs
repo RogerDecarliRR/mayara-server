@@ -2,6 +2,8 @@
 
 use super::super::target::{METERS_PER_DEGREE_LATITUDE, meters_per_degree_longitude};
 use super::super::Legend;
+use crate::config::GEO_ECHO_ALLOWED_SIZES;
+use rayon::prelude::*;
 use std::f64::consts::TAU;
 
 /// True when `bearing_deg` (North = 0, clockwise) lies in `[start, end)`.
@@ -56,6 +58,27 @@ pub fn viewport_size_px(
         1
     };
     ideal.max(1).min(max_size)
+}
+
+/// Snap a client `sizeHintPx` down to the largest allowed size ≤ hint
+/// (`GEO_ECHO_ALLOWED_SIZES`). Hint below the smallest allowed → smallest.
+pub fn snap_size_hint_to_allowed(hint: u32) -> u32 {
+    GEO_ECHO_ALLOWED_SIZES
+        .iter()
+        .copied()
+        .filter(|&s| s <= hint)
+        .max()
+        .unwrap_or(GEO_ECHO_ALLOWED_SIZES[0])
+}
+
+/// Effective max edge for paint: optional `sizeHint` caps `max_size_px`
+/// (RM-129 W2 A3/C1 — first pan at ~50% via client hint).
+pub fn effective_viewport_max_size_px(max_size_px: u32, size_hint: Option<u32>) -> u32 {
+    let max_size = max_size_px.max(1);
+    let Some(hint) = size_hint.filter(|&h| h > 0) else {
+        return max_size;
+    };
+    snap_size_hint_to_allowed(hint).min(max_size).max(1)
 }
 
 /// Paint one spoke into an RGBA buffer. Bearing 0 = north, clockwise; image
@@ -417,60 +440,64 @@ pub fn rasterize_viewport_with_world(
     let half_m = span * 0.5;
     let m_lon_bbox = meters_per_degree_longitude(&bbox_lat).max(1e-12);
     let m_lon_radar = meters_per_degree_longitude(&radar_lat).max(1e-12);
+    let r_min_m = annulus.r_min_m;
 
-    for py in 0..size {
-        for px in 0..size {
-            // Pixel centre → ENU relative to bbox centre → geographic.
-            let dx_m = (px as f64 + 0.5) * m_per_px - half_m;
-            let dy_m = half_m - (py as f64 + 0.5) * m_per_px;
-            let lat = bbox_lat + dy_m / METERS_PER_DEGREE_LATITUDE;
-            let lon = bbox_lon + dx_m / m_lon_bbox;
+    // RM-129 W2 A4: one row per rayon task — disjoint `par_chunks_mut` slices.
+    rgba.par_chunks_mut(size * 4)
+        .enumerate()
+        .for_each(|(py, row)| {
+            for px in 0..size {
+                // Pixel centre → ENU relative to bbox centre → geographic.
+                let dx_m = (px as f64 + 0.5) * m_per_px - half_m;
+                let dy_m = half_m - (py as f64 + 0.5) * m_per_px;
+                let lat = bbox_lat + dy_m / METERS_PER_DEGREE_LATITUDE;
+                let lon = bbox_lon + dx_m / m_lon_bbox;
 
-            // Geographic (r, θ) from the radar asset (N=0 CW).
-            let east = (lon - radar_lon) * m_lon_radar;
-            let north = (lat - radar_lat) * METERS_PER_DEGREE_LATITUDE;
-            let r = (east * east + north * north).sqrt();
-            let theta = bearing_deg_from_east_north(east, north);
+                // Geographic (r, θ) from the radar asset (N=0 CW).
+                let east = (lon - radar_lon) * m_lon_radar;
+                let north = (lat - radar_lat) * METERS_PER_DEGREE_LATITUDE;
+                let r = (east * east + north * north).sqrt();
+                let theta = bearing_deg_from_east_north(east, north);
 
-            if !annulus.contains(r, theta) {
-                continue;
-            }
-            if !bearing_in_sector(theta, usable_bearing_start_deg, usable_bearing_end_deg) {
-                continue;
-            }
-            // Operational usable radius (same mask as composition / geo-arpa).
-            if usable_radius_m.is_finite() && r > usable_radius_m + 1e-9 {
-                continue;
-            }
-            // Acquisition polar has no data past spoke_range; world sampling
-            // is limited only by the annulus / view_step / usable radius.
-            if !use_world && r > spoke_range_m + 1e-9 {
-                continue;
-            }
+                if !annulus.contains(r, theta) {
+                    continue;
+                }
+                if !bearing_in_sector(theta, usable_bearing_start_deg, usable_bearing_end_deg) {
+                    continue;
+                }
+                // Operational usable radius (same mask as composition / geo-arpa).
+                if usable_radius_m.is_finite() && r > usable_radius_m + 1e-9 {
+                    continue;
+                }
+                // Acquisition polar has no data past spoke_range; world sampling
+                // is limited only by the annulus / view_step / usable radius.
+                if !use_world && r > spoke_range_m + 1e-9 {
+                    continue;
+                }
 
-            let pix = sample_view_polar_nearest(
-                &view_polar,
-                spokes,
-                n_radial,
-                annulus.r_min_m,
-                m_per_bin,
-                r,
-                theta,
-            );
-            if pix == 0 {
-                continue;
+                let pix = sample_view_polar_nearest(
+                    &view_polar,
+                    spokes,
+                    n_radial,
+                    r_min_m,
+                    m_per_bin,
+                    r,
+                    theta,
+                );
+                if pix == 0 {
+                    continue;
+                }
+                let Some(lookup) = legend.pixels.get(pix as usize) else {
+                    continue;
+                };
+                let i = px * 4;
+                let c = &lookup.color;
+                row[i] = c.r;
+                row[i + 1] = c.g;
+                row[i + 2] = c.b;
+                row[i + 3] = c.a;
             }
-            let Some(lookup) = legend.pixels.get(pix as usize) else {
-                continue;
-            };
-            let i = (py * size + px) * 4;
-            let c = &lookup.color;
-            rgba[i] = c.r;
-            rgba[i + 1] = c.g;
-            rgba[i + 2] = c.b;
-            rgba[i + 3] = c.a;
-        }
-    }
+        });
     rgba
 }
 
@@ -635,6 +662,19 @@ mod tests {
             0,
             "sample beyond usableRadiusM must stay empty"
         );
+    }
+
+    #[test]
+    fn size_hint_snaps_down_to_allowed() {
+        assert_eq!(snap_size_hint_to_allowed(1024), 1024);
+        assert_eq!(snap_size_hint_to_allowed(1500), 1024);
+        assert_eq!(snap_size_hint_to_allowed(2048), 2048);
+        assert_eq!(snap_size_hint_to_allowed(3000), 2048);
+        assert_eq!(snap_size_hint_to_allowed(4096), 4096);
+        assert_eq!(snap_size_hint_to_allowed(500), 1024); // below min → min allowed
+        assert_eq!(effective_viewport_max_size_px(2048, Some(1024)), 1024);
+        assert_eq!(effective_viewport_max_size_px(2048, None), 2048);
+        assert_eq!(effective_viewport_max_size_px(1024, Some(2048)), 1024); // never above cfg max
     }
 
     #[test]

@@ -722,6 +722,9 @@ struct ViewportRequest {
     /// Antenna longitude (WGS84). When set with `radarLat`, overrides polar centre.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     radar_lon: Option<f64>,
+    /// Optional paint max edge (first pan ~50%); alias `sizeHint` accepted.
+    #[serde(default, alias = "sizeHint", skip_serializing_if = "Option::is_none")]
+    size_hint_px: Option<u32>,
 }
 
 /// Viewport render result — same shape as `echo.json` plus PNG path and scale.
@@ -929,12 +932,6 @@ async fn post_echo_viewport(
     if state.radars.get_by_key(&radar_id).is_none() {
         return no_such_radar(&radar_id, &state.radars);
     }
-    let bbox = BBox {
-        west: request.west,
-        south: request.south,
-        east: request.east,
-        north: request.north,
-    };
     let site = match (request.radar_lat, request.radar_lon) {
         (Some(lat), Some(lon)) => Some((lat, lon)),
         (None, None) => None,
@@ -945,7 +942,20 @@ async fn post_echo_viewport(
             );
         }
     };
-    match geo_echo::publish_viewport(&state.radars, &radar_id, bbox, site) {
+
+    // W1 D1: when GEO_ECHO_RENDERER_URL is set, forward paint (no local heavy fallback).
+    if let Some(base) = geo_echo::renderer_base_url() {
+        return forward_echo_viewport(base, &radar_id, &request, &state.radars).await;
+    }
+
+    let bbox = BBox {
+        west: request.west,
+        south: request.south,
+        east: request.east,
+        north: request.north,
+    };
+    match geo_echo::publish_viewport(&state.radars, &radar_id, bbox, site, request.size_hint_px)
+    {
         Ok(meta) => {
             let (span_ew, span_ns) = bbox.spans_m();
             let span = span_ew.max(span_ns).max(1e-6);
@@ -963,6 +973,77 @@ async fn post_echo_viewport(
         }
         Err(message) => SignalKResponse::failed(StatusCode::BAD_REQUEST, message),
     }
+}
+
+fn renderer_http_client() -> &'static reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+async fn forward_echo_viewport(
+    base: &str,
+    radar_id: &str,
+    request: &ViewportRequest,
+    radars: &SharedRadars,
+) -> Response {
+    let geo = radars.geo_echo_config();
+    let png_path = format!("/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport.png");
+    let mut body = serde_json::json!({
+        "west": request.west,
+        "south": request.south,
+        "east": request.east,
+        "north": request.north,
+        "radarLat": request.radar_lat,
+        "radarLon": request.radar_lon,
+        "radarId": radar_id,
+        "usableBearingStartDeg": geo.usable_bearing_start_deg,
+        "usableBearingEndDeg": geo.usable_bearing_end_deg,
+        "usableRadiusM": geo.effective_usable_radius_m(),
+        "maxSizePx": geo.max_size_px,
+        "targetMetersPerPx": geo.target_meters_per_px,
+        "maxViewportRangeM": geo.max_viewport_range_m,
+    });
+    if let Some(hint) = request.size_hint_px {
+        body["sizeHintPx"] = serde_json::json!(hint);
+    }
+    let url = format!("{base}/v1/viewport");
+    match renderer_http_client().post(&url).json(&body).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+            Ok(mut value) => {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("pngPath".to_string(), Value::String(png_path));
+                }
+                Json(value).into_response()
+            }
+            Err(_) => viewport_forward_unavailable(request, radar_id, StatusCode::SERVICE_UNAVAILABLE),
+        },
+        _ => viewport_forward_unavailable(request, radar_id, StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
+fn viewport_forward_unavailable(
+    request: &ViewportRequest,
+    radar_id: &str,
+    status: StatusCode,
+) -> Response {
+    let cold = geo_echo::EchoFrame::unavailable();
+    let png_path = format!("/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport.png");
+    (
+        status,
+        Json(ViewportResponse {
+            meta: cold.meta,
+            bbox: request.clone(),
+            meters_per_px: 0.0,
+            png_path,
+        }),
+    )
+        .into_response()
 }
 
 #[utoipa::path(
@@ -987,6 +1068,43 @@ async fn get_echo_viewport_png(
     if state.radars.get_by_key(&radar_id).is_none() {
         return no_such_radar(&radar_id, &state.radars);
     }
+
+    // W1 D1: proxy last PNG from renderer when GEO_ECHO_RENDERER_URL is set.
+    if let Some(base) = geo_echo::renderer_base_url() {
+        let url = format!("{base}/v1/viewport.png");
+        match renderer_http_client().get(&url).send().await {
+            Ok(resp) if resp.status().is_success() => match resp.bytes().await {
+                Ok(bytes) => {
+                    return (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "image/png")],
+                        bytes,
+                    )
+                        .into_response();
+                }
+                Err(_) => {
+                    let png = geo_echo::EchoFrame::unavailable().png;
+                    return (
+                        StatusCode::OK,
+                        [(axum::http::header::CONTENT_TYPE, "image/png")],
+                        png,
+                    )
+                        .into_response();
+                }
+            },
+            _ => {
+                // Keep-last / cold: transparent PNG (HTTP 200), same as local empty slot.
+                let png = geo_echo::EchoFrame::unavailable().png;
+                return (
+                    StatusCode::OK,
+                    [(axum::http::header::CONTENT_TYPE, "image/png")],
+                    png,
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Ensure compositor (and empty viewport slot) exist.
     let _ = geo_echo::ensure_entry(&state.radars, &radar_id);
     let png = geo_echo::viewport_frame(&radar_id)

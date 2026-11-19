@@ -4,7 +4,8 @@ use bytes::Bytes;
 use enum_primitive_derive::Primitive;
 use portable_atomic::AtomicU64;
 use protobuf::Message;
-use serde::Serialize;
+use serde::de::{self, Deserializer, Visitor};
+use serde::{Deserialize, Serialize};
 use serde::ser::Serializer;
 use serde_json::Value;
 use std::cmp::{max, min};
@@ -201,7 +202,7 @@ impl IntoResponse for RadarError {
 //
 // This order of pixeltypes is also how they are stored in the legend.
 //
-#[derive(Serialize, Clone, Debug, ToSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, ToSchema)]
 #[serde(rename_all = "camelCase")]
 enum PixelType {
     Normal,
@@ -211,7 +212,7 @@ enum PixelType {
     History,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Color {
     r: u8,
     g: u8,
@@ -289,14 +290,38 @@ impl Serialize for Color {
     }
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+impl<'de> Deserialize<'de> for Color {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ColorVisitor;
+        impl<'de> Visitor<'de> for ColorVisitor {
+            type Value = Color;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a CSS hex color string")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Color, E>
+            where
+                E: de::Error,
+            {
+                Ok(Color::from_css(v))
+            }
+        }
+        deserializer.deserialize_str(ColorVisitor)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct Lookup {
     r#type: PixelType,
     #[schema(value_type = String, example = "#334455ff")]
     color: Color,
 }
 
-#[derive(Clone, Debug, Serialize, ToSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Legend {
     /// Doppler approaching pixel range: `(first_index, count)`.

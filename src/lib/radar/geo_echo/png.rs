@@ -15,6 +15,7 @@ pub fn encode_rgba(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, png:
         let mut encoder = png::Encoder::new(&mut out, width, height);
         encoder.set_color(png::ColorType::Rgba);
         encoder.set_depth(png::BitDepth::Eight);
+        // RM-129 W2 A7: Fast already — encode latency over file size.
         encoder.set_compression(png::Compression::Fast);
         let mut writer = encoder.write_header()?;
         writer.write_image_data(rgba)?;

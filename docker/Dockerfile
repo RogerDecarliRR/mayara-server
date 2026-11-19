@@ -34,7 +34,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/usr/src/mayara-server/target \
     cargo build --release \
-    && cp /usr/src/mayara-server/target/release/mayara-server /usr/src/mayara-server/mayara-server
+    && cp /usr/src/mayara-server/target/release/mayara-server /usr/src/mayara-server/mayara-server \
+    && cp /usr/src/mayara-server/target/release/geo-echo-renderer /usr/src/mayara-server/geo-echo-renderer
 
 FROM alpine:3.21
 LABEL org.opencontainers.image.source="https://github.com/MarineYachtRadar/mayara-server"
@@ -45,19 +46,22 @@ RUN printf 'precedence :ffff:0:0/96  100\n' > /etc/gai.conf \
     && apk add --no-cache tini \
     && adduser -D -h /home/mayara mayara
 COPY --from=builder /usr/src/mayara-server/mayara-server /usr/local/bin/mayara-server
+COPY --from=builder /usr/src/mayara-server/geo-echo-renderer /usr/local/bin/geo-echo-renderer
 # Names this deployment in the usage stats a user may agree to send, so a
 # container install is not counted as someone running the binary by hand.
 # A packager that builds on this image overrides it (the Signal K plugin
 # passes signalk-server-plugin).
 ENV MAYARA_DEPLOYMENT=container
 USER mayara
-EXPOSE 6502
+EXPOSE 6502 6503
 # Probe the always-served, unauthenticated discovery doc so the container
 # reports healthy once mayara's HTTP server is up. Deliberately checks only
 # mayara itself, not the upstream Signal K connection — a boat offline from
 # Signal K still runs a healthy radar server. Uses BusyBox wget (already in
 # the Alpine base; no curl). The in-container port is always 6502 regardless
 # of how Signal K proxies it externally.
+# Note: geo-echo-renderer (CMD override) listens on 6503; its /health is not
+# this HEALTHCHECK — lab compose may override or ignore when that binary runs.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD wget -q -O /dev/null http://127.0.0.1:6502/signalk || exit 1
 ENTRYPOINT ["tini", "--"]

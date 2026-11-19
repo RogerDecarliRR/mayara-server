@@ -10,7 +10,8 @@ use super::annulus::{
 };
 use super::raster::{
     rasterize_polar_masked, rasterize_viewport, rasterize_viewport_with_world,
-    view_range_from_bbox, viewport_image_corners, viewport_size_px, BBox,
+    effective_viewport_max_size_px, view_range_from_bbox, viewport_image_corners, viewport_size_px,
+    BBox,
 };
 use super::state::{PolarBuffer, RevClock};
 use crate::navdata;
@@ -134,6 +135,7 @@ pub fn publish_viewport(
     radar_id: &str,
     bbox: BBox,
     site: Option<(f64, f64)>,
+    size_hint: Option<u32>,
 ) -> Result<EchoMeta, String> {
     bbox.validate()?;
     let (_, viewport_slot, snapshot_slot) = ensure_entry(radars, radar_id)
@@ -175,7 +177,8 @@ pub fn publish_viewport(
     let effective_target = geo
         .target_meters_per_px
         .min(m_bin.max(crate::config::GEO_ECHO_MIN_TARGET_M_PER_PX));
-    let size_px = viewport_size_px(span_ew, span_ns, effective_target, geo.max_size_px);
+    let max_for_paint = effective_viewport_max_size_px(geo.max_size_px, size_hint);
+    let size_px = viewport_size_px(span_ew, span_ns, effective_target, max_for_paint);
     let refresh = refresh_interval_ms(snap.period_ms);
     let meters_per_px = {
         let span = span_ew.max(span_ns).max(1e-6);
@@ -444,18 +447,21 @@ fn store_snapshot(
     legend: &Legend,
     spoke_range_m: f64,
 ) {
+    let snap = PolarSnapshot {
+        data: polar.data.clone(),
+        spokes: polar.spokes,
+        spoke_len: polar.spoke_len,
+        center: polar.last_center.or_else(resolve_nav_center),
+        spoke_range_m,
+        legend: legend.clone(),
+        revolution_id: clock.revolution_id,
+        period_ms: clock.period_ms(),
+    };
     if let Ok(mut slot) = snapshot.write() {
-        *slot = PolarSnapshot {
-            data: polar.data.clone(),
-            spokes: polar.spokes,
-            spoke_len: polar.spoke_len,
-            center: polar.last_center.or_else(resolve_nav_center),
-            spoke_range_m,
-            legend: legend.clone(),
-            revolution_id: clock.revolution_id,
-            period_ms: clock.period_ms(),
-        };
+        *slot = snap.clone();
     }
+    // W1 D1: push MEPO to geo-echo-renderer when GEO_ECHO_RENDERER_URL is set.
+    super::renderer_client::push_polar_snapshot(&snap);
 }
 
 fn publish_frame(
