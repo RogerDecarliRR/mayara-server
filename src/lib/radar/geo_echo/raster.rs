@@ -63,7 +63,8 @@ pub fn viewport_size_px(
 ///
 /// `scale` maps spoke range onto the composition canvas
 /// (`spoke_range_m / composition_range_m`). Values &lt; 1 paint an interior
-/// circle; values &gt; 1 clip at the canvas edge.
+/// circle; values &gt; 1 clip at the canvas edge. Full circle, no usable-radius
+/// clip beyond the canvas edge.
 #[allow(dead_code)]
 pub fn paint_spoke_rgba(
     rgba: &mut [u8],
@@ -84,11 +85,16 @@ pub fn paint_spoke_rgba(
         scale,
         0.0,
         360.0,
+        f64::INFINITY,
+        1.0,
     );
 }
 
 /// Like [`paint_spoke_rgba`] but skips the spoke when its bearing is outside
-/// the usable sector.
+/// the usable sector, and clips samples beyond `usable_radius_m`.
+///
+/// `composition_range_m` is the canvas half-side (metres); radial clip is
+/// `r ≤ usable_radius_m` mapped onto that canvas (`usable ≤ composition`).
 pub fn paint_spoke_rgba_masked(
     rgba: &mut [u8],
     size: u32,
@@ -99,6 +105,8 @@ pub fn paint_spoke_rgba_masked(
     scale: f64,
     usable_bearing_start_deg: f64,
     usable_bearing_end_deg: f64,
+    usable_radius_m: f64,
+    composition_range_m: f64,
 ) {
     if spokes == 0 || data.is_empty() || scale <= 0.0 {
         return;
@@ -118,6 +126,12 @@ pub fn paint_spoke_rgba_masked(
     let sin_a = angle.sin();
     let cos_a = angle.cos();
     let spoke_len = data.len() as f64;
+    // Radial mask analogous to bearing_in_sector: paint only r ≤ usableRadiusM.
+    let max_dist = if usable_radius_m.is_finite() && composition_range_m > 0.0 {
+        half * (usable_radius_m / composition_range_m).clamp(0.0, 1.0)
+    } else {
+        half
+    };
 
     for (r, &pix) in data.iter().enumerate() {
         if pix == 0 {
@@ -129,6 +143,9 @@ pub fn paint_spoke_rgba_masked(
         let color = &lookup.color;
         let dist = (r as f64 + 0.5) / spoke_len * half * scale;
         if dist > half + 0.5 {
+            continue;
+        }
+        if dist > max_dist + 0.5 {
             continue;
         }
         let x = (cx + dist * sin_a).round() as isize;
@@ -151,7 +168,8 @@ pub fn paint_spoke_rgba_masked(
 /// Rasterize a full polar buffer (`spokes * spoke_len` bytes, row-major by spoke).
 ///
 /// Samples are scaled from `spoke_range_m` onto a canvas whose half-side is
-/// `composition_range_m`. Full bearing circle (compat wrapper).
+/// `composition_range_m`. Full bearing circle, usable radius = composition
+/// (compat wrapper).
 #[allow(dead_code)]
 pub fn rasterize_polar(
     polar: &[u8],
@@ -172,10 +190,11 @@ pub fn rasterize_polar(
         composition_range_m,
         0.0,
         360.0,
+        composition_range_m,
     )
 }
 
-/// Composition raster with a usable-bearing mask.
+/// Composition raster with usable-bearing and usable-radius masks.
 pub fn rasterize_polar_masked(
     polar: &[u8],
     spokes: usize,
@@ -186,6 +205,7 @@ pub fn rasterize_polar_masked(
     composition_range_m: f64,
     usable_bearing_start_deg: f64,
     usable_bearing_end_deg: f64,
+    usable_radius_m: f64,
 ) -> Vec<u8> {
     let size = size_px.max(1) as usize;
     let mut rgba = vec![0u8; size * size * 4];
@@ -213,6 +233,8 @@ pub fn rasterize_polar_masked(
             scale,
             usable_bearing_start_deg,
             usable_bearing_end_deg,
+            usable_radius_m,
+            composition_range_m,
         );
     }
     rgba
@@ -298,6 +320,7 @@ pub fn rasterize_viewport(
     bbox: BBox,
     usable_bearing_start_deg: f64,
     usable_bearing_end_deg: f64,
+    usable_radius_m: f64,
 ) -> Vec<u8> {
     rasterize_viewport_with_world(
         polar,
@@ -312,6 +335,7 @@ pub fn rasterize_viewport(
         bbox,
         usable_bearing_start_deg,
         usable_bearing_end_deg,
+        usable_radius_m,
         None,
     )
 }
@@ -333,6 +357,7 @@ pub fn rasterize_viewport_with_world(
     bbox: BBox,
     usable_bearing_start_deg: f64,
     usable_bearing_end_deg: f64,
+    usable_radius_m: f64,
     world_echo: Option<&dyn Fn(f64, f64) -> u8>,
 ) -> Vec<u8> {
     use super::annulus::{
@@ -413,8 +438,12 @@ pub fn rasterize_viewport_with_world(
             if !bearing_in_sector(theta, usable_bearing_start_deg, usable_bearing_end_deg) {
                 continue;
             }
+            // Operational usable radius (same mask as composition / geo-arpa).
+            if usable_radius_m.is_finite() && r > usable_radius_m + 1e-9 {
+                continue;
+            }
             // Acquisition polar has no data past spoke_range; world sampling
-            // is limited only by the annulus / view_step window.
+            // is limited only by the annulus / view_step / usable radius.
             if !use_world && r > spoke_range_m + 1e-9 {
                 continue;
             }
@@ -567,7 +596,7 @@ mod tests {
         let size: u32 = 64;
         // Only northern quarter [315, 45) — spoke 0 at 0° included; others out.
         let rgba = rasterize_polar_masked(
-            &polar, spokes, spoke_len, &legend, size, 1000.0, 1000.0, 315.0, 45.0,
+            &polar, spokes, spoke_len, &legend, size, 1000.0, 1000.0, 315.0, 45.0, 1000.0,
         );
         let cx = (size / 2) as usize;
         let north_painted = (0..cx).any(|y| rgba[(y * size as usize + cx) * 4 + 3] == 255);
@@ -575,6 +604,37 @@ mod tests {
             .any(|y| rgba[(y * size as usize + cx) * 4 + 3] == 255);
         assert!(north_painted, "north spoke in sector should paint");
         assert!(!south_painted, "south spoke outside sector must stay empty");
+    }
+
+    #[test]
+    fn composition_usable_radius_clips_outer_samples() {
+        let spokes = 1;
+        let spoke_len = 64;
+        let polar = vec![1u8; spokes * spoke_len];
+        let legend = solid_legend();
+        let size: u32 = 128;
+        let composition = 1000.0;
+        let usable = 250.0; // quarter of canvas radius
+        let rgba = rasterize_polar_masked(
+            &polar, spokes, spoke_len, &legend, size, composition, composition, 0.0, 360.0, usable,
+        );
+        let cx = (size / 2) as usize;
+        let half = cx as f64;
+        let max_r_px = half * (usable / composition);
+        // Near centre (inside usable) must paint.
+        let near_y = cx - (max_r_px * 0.4).round() as usize;
+        assert_eq!(
+            rgba[(near_y * size as usize + cx) * 4 + 3],
+            255,
+            "sample inside usableRadiusM must paint"
+        );
+        // Near canvas rim (outside usable) must stay empty.
+        let far_y = 1usize;
+        assert_eq!(
+            rgba[(far_y * size as usize + cx) * 4 + 3],
+            0,
+            "sample beyond usableRadiusM must stay empty"
+        );
     }
 
     #[test]
@@ -655,6 +715,7 @@ mod tests {
             bbox,
             0.0,
             360.0,
+            f64::INFINITY,
         );
         assert!(rgba.iter().all(|&b| b == 0));
     }
@@ -695,6 +756,7 @@ mod tests {
             bbox_b,
             0.0,
             360.0,
+            f64::INFINITY,
         );
         let painted_b = with_site_b.chunks(4).filter(|px| px[3] > 0).count();
         assert!(
@@ -715,6 +777,7 @@ mod tests {
             bbox_b,
             0.0,
             360.0,
+            f64::INFINITY,
         );
         assert!(
             with_site_a.iter().all(|&b| b == 0),
@@ -763,6 +826,7 @@ mod tests {
             bbox,
             0.0,
             360.0,
+            f64::INFINITY,
         );
         let painted = rgba.chunks(4).filter(|px| px[3] > 0).count();
         assert!(
@@ -824,6 +888,7 @@ mod tests {
             bbox,
             0.0,
             360.0,
+            f64::INFINITY,
         );
         let rgba_b = rasterize_viewport(
             &place_hit(range_b),
@@ -838,6 +903,7 @@ mod tests {
             bbox,
             0.0,
             360.0,
+            f64::INFINITY,
         );
         let mask = |rgba: &[u8]| -> Vec<bool> {
             rgba.chunks(4).map(|px| px[3] > 0).collect()
@@ -899,6 +965,7 @@ mod tests {
             bbox,
             0.0,
             360.0,
+            f64::INFINITY,
             Some(&echo),
         );
         let rgba_b = rasterize_viewport_with_world(
@@ -914,6 +981,7 @@ mod tests {
             bbox,
             0.0,
             360.0,
+            f64::INFINITY,
             Some(&echo),
         );
         let mask = |rgba: &[u8]| -> Vec<bool> {
@@ -970,6 +1038,7 @@ mod tests {
             bbox,
             0.0,
             360.0,
+            f64::INFINITY,
         );
         let painted = rgba.chunks(4).filter(|px| px[3] > 0).count();
         assert!(painted > 0, "annulus must paint something");

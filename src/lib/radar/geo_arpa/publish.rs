@@ -104,7 +104,7 @@ pub fn distance_and_bearing(from: &GeoPosition, to: &GeoPosition) -> (f64, f64) 
 /// Publish monitor ARPA for `radar_id`. Without an enumerator → unavailable.
 pub fn publish_geo_arpa(radars: &SharedRadars, radar_id: &str) -> GeoArpaMeta {
     let geo = radars.geo_echo_config();
-    let max_range_m = geo.composition_range_m;
+    let max_range_m = geo.effective_usable_radius_m();
     let Some(_info) = radars.get_by_key(radar_id) else {
         return GeoArpaMeta::unavailable(radar_id, max_range_m);
     };

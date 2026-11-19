@@ -69,6 +69,25 @@ fn main() {
     println!("cargo::rerun-if-changed=build.rs");
     println!("cargo::rerun-if-changed=Cargo.toml");
     println!("cargo::rerun-if-changed=src/protos/RadarMessage.proto");
+    // rust-embed #[folder = "web/"] — sem isto, Docker BuildKit cache em
+    // target/ pode reutilizar o binário antigo quando só muda HTML/JS
+    // (ex.: /config/ «Alcance útil»). Cargo não vê web/ como input do crate.
+    rerun_if_changed_tree(PathBuf::from("web"));
+}
+
+fn rerun_if_changed_tree(dir: PathBuf) {
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            rerun_if_changed_tree(path);
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }
 
 /// Point this clone's `core.hooksPath` at `.githooks/` on first `cargo build`,

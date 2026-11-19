@@ -117,8 +117,11 @@ pub(crate) struct TelemetryConfig {
     pub consent: Option<bool>,
 }
 
-/// Fixed composition window for the north-up geo echo overlay (and geo-arpa
-/// monitor coverage). Independent of the operator's `ControlId::Range`.
+/// Fixed composition window for the north-up geo echo overlay.
+/// Independent of the operator's `ControlId::Range`.
+///
+/// `composition_range_m` = canvas/disco half-side; operational emission uses
+/// `usable_radius_m` (≤ composition) × usable bearings.
 pub const GEO_ECHO_MIN_RANGE_M: f64 = 50.0;
 pub const GEO_ECHO_MAX_RANGE_M: f64 = 120.0 * 1852.0;
 pub const GEO_ECHO_ALLOWED_SIZES: &[u32] = &[1024, 2048, 4096];
@@ -166,7 +169,8 @@ pub struct GeoEchoConfig {
     #[serde(default)]
     pub mode: GeoEchoMode,
     /// Half-side of the composition square in metres (image edge to centre).
-    /// Also the physical acquisition Range (dual-stream); GUI zoom is separate.
+    /// Canvas / disco only; GUI zoom is separate. Operational emission uses
+    /// [`Self::usable_radius_m`].
     #[serde(default = "default_composition_range_m")]
     pub composition_range_m: f64,
     /// PNG edge length in pixels for composition mode; only 1024, 2048 or 4096.
@@ -188,6 +192,11 @@ pub struct GeoEchoConfig {
     /// Usable sector end bearing in degrees (North = 0, clockwise; 360 = full).
     #[serde(default = "default_usable_bearing_end_deg")]
     pub usable_bearing_end_deg: f64,
+    /// Operational usable radius in metres (echo + geo-arpa emission).
+    /// `None` / omitted / legacy → equals [`Self::composition_range_m`].
+    /// Must be ≤ composition; [`Self::normalized`] clamps when larger.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usable_radius_m: Option<f64>,
 }
 
 impl Default for GeoEchoConfig {
@@ -201,6 +210,7 @@ impl Default for GeoEchoConfig {
             max_viewport_range_m: None,
             usable_bearing_start_deg: default_usable_bearing_start_deg(),
             usable_bearing_end_deg: default_usable_bearing_end_deg(),
+            usable_radius_m: None,
         }
     }
 }
@@ -211,6 +221,22 @@ impl GeoEchoConfig {
         self.max_viewport_range_m
             .filter(|v| v.is_finite() && *v > 0.0)
             .unwrap_or(self.composition_range_m)
+    }
+
+    /// Effective usable radius (metres): explicit value or composition canvas.
+    ///
+    /// Always ≤ [`Self::composition_range_m`] after [`Self::normalized`].
+    pub fn effective_usable_radius_m(&self) -> f64 {
+        let composition = self.composition_range_m;
+        match self.usable_radius_m {
+            Some(m)
+                if m.is_finite()
+                    && (GEO_ECHO_MIN_RANGE_M..=GEO_ECHO_MAX_RANGE_M).contains(&m) =>
+            {
+                m.min(composition)
+            }
+            _ => composition,
+        }
     }
 
     /// Clamp / repair values loaded from disk so the compositor always sees a
@@ -237,20 +263,28 @@ impl GeoEchoConfig {
         }
         self.usable_bearing_start_deg = normalize_bearing_deg(self.usable_bearing_start_deg);
         self.usable_bearing_end_deg = normalize_bearing_end_deg(self.usable_bearing_end_deg);
+        self.usable_radius_m = match self.usable_radius_m {
+            None => None,
+            Some(m) if !m.is_finite() => None,
+            Some(m) if !(GEO_ECHO_MIN_RANGE_M..=GEO_ECHO_MAX_RANGE_M).contains(&m) => None,
+            Some(m) if m > self.composition_range_m => Some(self.composition_range_m),
+            Some(m) => Some(m),
+        };
         self
     }
 
-    /// Guard zone 1 for Auto-ARPA acquisition: usable bearings × composition range.
+    /// Guard zone 1 for Auto-ARPA acquisition: usable bearings × usable radius.
     ///
     /// Angles are converted from degrees (N=0 CW) to radians; equal start/end
     /// means a full circle (see blob detector). `enabled` is always true.
+    /// `end_distance` is the operational usable radius, not the composition canvas.
     pub fn arpa_acquisition_guard_zone(&self) -> GuardZone {
         let n = self.clone().normalized();
         GuardZone {
             start_angle: n.usable_bearing_start_deg.to_radians(),
             end_angle: n.usable_bearing_end_deg.to_radians(),
             start_distance: 0.0,
-            end_distance: n.composition_range_m,
+            end_distance: n.effective_usable_radius_m(),
             enabled: true,
         }
     }
@@ -287,6 +321,14 @@ impl GeoEchoConfig {
             if !(GEO_ECHO_MIN_RANGE_M..=GEO_ECHO_MAX_RANGE_M).contains(&m) {
                 return Err(format!(
                     "maxViewportRangeM must be between {} and {} metres",
+                    GEO_ECHO_MIN_RANGE_M, GEO_ECHO_MAX_RANGE_M
+                ));
+            }
+        }
+        if let Some(m) = self.usable_radius_m {
+            if !(GEO_ECHO_MIN_RANGE_M..=GEO_ECHO_MAX_RANGE_M).contains(&m) {
+                return Err(format!(
+                    "usableRadiusM must be between {} and {} metres",
                     GEO_ECHO_MIN_RANGE_M, GEO_ECHO_MAX_RANGE_M
                 ));
             }
@@ -703,17 +745,19 @@ impl Persistence {
         self.config.geo_echo.clone().normalized()
     }
 
-    /// Persist geo-echo settings. Returns the stored (validated) config, or
-    /// an error when validation fails or the settings file cannot be written.
+    /// Persist geo-echo settings. Returns the stored (validated + normalized)
+    /// config, or an error when validation fails or the settings file cannot
+    /// be written.
     pub(crate) fn set_geo_echo(&mut self, cfg: GeoEchoConfig) -> Result<GeoEchoConfig, String> {
         cfg.validate()?;
+        let stored = cfg.normalized();
         let previous = self.config.geo_echo.clone();
-        self.config.geo_echo = cfg.clone();
+        self.config.geo_echo = stored.clone();
         if self.is_storing() && !self.save() {
             self.config.geo_echo = previous;
             return Err("cannot store geo-echo settings".to_string());
         }
-        Ok(cfg.normalized())
+        Ok(stored)
     }
 
     pub(crate) fn store(&mut self, radar_info: &RadarInfo) {
@@ -984,13 +1028,19 @@ mod tests {
         assert_eq!(cfg.max_size_px, 2048);
         assert!((cfg.usable_bearing_start_deg - 0.0).abs() < 1e-9);
         assert!((cfg.usable_bearing_end_deg - 360.0).abs() < 1e-9);
+        assert!(cfg.usable_radius_m.is_none());
+        assert!(
+            (cfg.effective_usable_radius_m() - cfg.composition_range_m).abs() < 1e-9,
+            "omit/legacy usableRadiusM follows composition"
+        );
         cfg.validate().unwrap();
     }
 
     #[test]
-    fn arpa_acquisition_guard_zone_maps_deg_to_rad_and_composition_range() {
+    fn arpa_acquisition_guard_zone_maps_deg_to_rad_and_usable_radius() {
         let cfg = GeoEchoConfig {
             composition_range_m: 6.0 * 1852.0,
+            usable_radius_m: Some(3.0 * 1852.0),
             usable_bearing_start_deg: 45.0,
             usable_bearing_end_deg: 135.0,
             ..GeoEchoConfig::default()
@@ -999,7 +1049,7 @@ mod tests {
         assert!((zone.start_angle - 45.0_f64.to_radians()).abs() < 1e-12);
         assert!((zone.end_angle - 135.0_f64.to_radians()).abs() < 1e-12);
         assert_eq!(zone.start_distance, 0.0);
-        assert!((zone.end_distance - 6.0 * 1852.0).abs() < 1e-9);
+        assert!((zone.end_distance - 3.0 * 1852.0).abs() < 1e-9);
         assert!(zone.enabled);
 
         let full = GeoEchoConfig::default().arpa_acquisition_guard_zone();
@@ -1007,6 +1057,38 @@ mod tests {
         assert!((full.end_angle - 360.0_f64.to_radians()).abs() < 1e-12);
         assert!((full.end_distance - 14.0 * 1852.0).abs() < 1e-9);
         assert!(full.enabled);
+    }
+
+    #[test]
+    fn usable_radius_normalize_clamps_above_composition() {
+        let cfg = GeoEchoConfig {
+            composition_range_m: 6.0 * 1852.0,
+            usable_radius_m: Some(10.0 * 1852.0),
+            ..GeoEchoConfig::default()
+        }
+        .normalized();
+        assert!((cfg.usable_radius_m.unwrap() - 6.0 * 1852.0).abs() < 1e-9);
+        assert!((cfg.effective_usable_radius_m() - 6.0 * 1852.0).abs() < 1e-9);
+
+        let legacy = GeoEchoConfig {
+            composition_range_m: 8.0 * 1852.0,
+            usable_radius_m: None,
+            ..GeoEchoConfig::default()
+        }
+        .normalized();
+        assert!(legacy.usable_radius_m.is_none());
+        assert!((legacy.effective_usable_radius_m() - 8.0 * 1852.0).abs() < 1e-9);
+
+        let out_of_bounds = GeoEchoConfig {
+            composition_range_m: 6.0 * 1852.0,
+            usable_radius_m: Some(1.0), // below GEO_ECHO_MIN_RANGE_M
+            ..GeoEchoConfig::default()
+        }
+        .normalized();
+        assert!(out_of_bounds.usable_radius_m.is_none());
+        assert!(
+            (out_of_bounds.effective_usable_radius_m() - 6.0 * 1852.0).abs() < 1e-9
+        );
     }
 
     #[test]
@@ -1053,6 +1135,14 @@ mod tests {
             .validate()
             .is_err()
         );
+        assert!(
+            GeoEchoConfig {
+                usable_radius_m: Some(10.0),
+                ..GeoEchoConfig::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
@@ -1066,8 +1156,10 @@ mod tests {
             max_viewport_range_m: Some(8.0 * 1852.0),
             usable_bearing_start_deg: 10.0,
             usable_bearing_end_deg: 350.0,
+            usable_radius_m: Some(4.0 * 1852.0),
         };
         let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("usable_radius_m") || json.contains("usableRadiusM"));
         let back: GeoEchoConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cfg);
         assert!(
@@ -1079,6 +1171,13 @@ mod tests {
             .abs()
                 < 1e-9
         );
+        // Legacy JSON without usableRadiusM → None → effective = composition.
+        let legacy: GeoEchoConfig = serde_json::from_str(
+            r#"{"mode":"viewport","composition_range_m":25928.0,"echo_size_px":2048,"target_meters_per_px":2.0,"max_size_px":2048,"usable_bearing_start_deg":0.0,"usable_bearing_end_deg":360.0}"#,
+        )
+        .unwrap();
+        assert!(legacy.usable_radius_m.is_none());
+        assert!((legacy.effective_usable_radius_m() - 25928.0).abs() < 1e-6);
     }
 
     #[test]

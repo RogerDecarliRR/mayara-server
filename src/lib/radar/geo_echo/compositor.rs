@@ -214,6 +214,7 @@ pub fn publish_viewport(
             bbox,
             geo.usable_bearing_start_deg,
             geo.usable_bearing_end_deg,
+            geo.effective_usable_radius_m(),
             Some(&echo),
         )
     } else {
@@ -230,6 +231,7 @@ pub fn publish_viewport(
             bbox,
             geo.usable_bearing_start_deg,
             geo.usable_bearing_end_deg,
+            geo.effective_usable_radius_m(),
         )
     };
     let png_bytes = encode_rgba(size_px, size_px, &rgba)
@@ -495,6 +497,7 @@ fn publish_frame(
         composition_range_m,
         geo.usable_bearing_start_deg,
         geo.usable_bearing_end_deg,
+        geo.effective_usable_radius_m(),
     );
     let png_bytes = match encode_rgba(size_px, size_px, &rgba) {
         Ok(b) => b,

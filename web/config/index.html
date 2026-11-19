@@ -1,7 +1,7 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="pt-BR">
 <head>
-    <title>Mayara — Geo Echo Configuration</title>
+    <title>Mayara — Configuração Geo Echo</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <style>
@@ -41,21 +41,22 @@
 </head>
 <body>
     <p><a href="/">← Mayara</a></p>
-    <h1>Geo Echo Configuration</h1>
-    <p class="hint">MapLibre radar echo overlay. Independent of Control Range.</p>
+    <h1>Configuração Geo Echo</h1>
+    <p class="hint">Sobreposição de eco no mapa. Independente do alcance da GUI do radar.</p>
 
     <form id="geo-echo-form">
-        <label for="mode">Mode</label>
+        <label for="mode">Modo</label>
         <select id="mode" name="mode" required>
-            <option value="viewport">viewport (map bbox — recommended)</option>
-            <option value="composition">composition (fixed NM window)</option>
+            <option value="viewport">viewport (bbox do mapa — recomendado)</option>
+            <option value="composition">composition (janela fixa em NM)</option>
         </select>
 
         <div id="composition-fields" class="mode-block">
-            <label for="compositionNm">Composition range (NM)</label>
+            <label for="compositionNm">Alcance de composição (NM)</label>
             <input id="compositionNm" name="compositionNm" type="number" min="0.027" max="120" step="any" required />
+            <span class="field-hint">Canvas/disco da imagem; tipicamente ≥ alcance útil.</span>
 
-            <label for="echoSizePx">PNG resolution (px)</label>
+            <label for="echoSizePx">Resolução PNG (px)</label>
             <select id="echoSizePx" name="echoSizePx" required>
                 <option value="1024">1024</option>
                 <option value="2048">2048</option>
@@ -64,11 +65,11 @@
         </div>
 
         <div id="viewport-fields" class="mode-block">
-            <label for="targetMetersPerPx">Target metres per pixel</label>
+            <label for="targetMetersPerPx">Metros por pixel alvo</label>
             <input id="targetMetersPerPx" name="targetMetersPerPx" type="number" min="0.25" max="100" step="any" required />
-            <span class="field-hint">Aim for up to 2 m/px; when the PNG hits max size, zooming out degrades resolution (m/px worsens).</span>
+            <span class="field-hint">Ideal até 2 m/px; ao atingir o tamanho máximo do PNG, afastar o zoom piora a resolução.</span>
 
-            <label for="maxSizePx">Max PNG size (px)</label>
+            <label for="maxSizePx">Tamanho máximo do PNG (px)</label>
             <select id="maxSizePx" name="maxSizePx" required>
                 <option value="1024">1024</option>
                 <option value="2048">2048</option>
@@ -76,15 +77,19 @@
             </select>
         </div>
 
-        <label for="usableBearingStartDeg">Usable bearing start (°)</label>
+        <label for="usableRadiusNm">Alcance útil (NM)</label>
+        <input id="usableRadiusNm" name="usableRadiusNm" type="number" min="0.027" max="120" step="any" required />
+        <span class="field-hint">Raio emitido no eco e nos alvos; se maior que a composição, é limitado a ela.</span>
+
+        <label for="usableBearingStartDeg">Rumo útil inicial (°)</label>
         <input id="usableBearingStartDeg" name="usableBearingStartDeg" type="number" min="0" max="360" step="any" required />
-        <span class="field-hint">North = 0, clockwise. Sector wraps when start &gt; end.</span>
+        <span class="field-hint">Norte = 0, sentido horário. O setor envolve o norte quando início &gt; fim.</span>
 
-        <label for="usableBearingEndDeg">Usable bearing end (°)</label>
+        <label for="usableBearingEndDeg">Rumo útil final (°)</label>
         <input id="usableBearingEndDeg" name="usableBearingEndDeg" type="number" min="0" max="360" step="any" required />
-        <span class="field-hint">Use 360 for a full circle from 0.</span>
+        <span class="field-hint">Use 360 para círculo completo a partir de 0.</span>
 
-        <button type="submit">Save</button>
+        <button type="submit">Salvar</button>
     </form>
     <div id="status" role="status"></div>
 
@@ -95,6 +100,7 @@
         const statusEl = document.getElementById("status");
         const modeSelect = document.getElementById("mode");
         const nmInput = document.getElementById("compositionNm");
+        const usableNmInput = document.getElementById("usableRadiusNm");
         const sizeSelect = document.getElementById("echoSizePx");
         const targetMpp = document.getElementById("targetMetersPerPx");
         const maxSizeSelect = document.getElementById("maxSizePx");
@@ -121,6 +127,10 @@
         function applyData(data) {
             modeSelect.value = data.mode === "composition" ? "composition" : "viewport";
             nmInput.value = (data.compositionRangeM / NM);
+            const usableM = (data.usableRadiusM != null)
+                ? data.usableRadiusM
+                : data.compositionRangeM;
+            usableNmInput.value = (usableM / NM);
             sizeSelect.value = String(data.echoSizePx);
             targetMpp.value = data.targetMetersPerPx;
             maxSizeSelect.value = String(data.maxSizePx);
@@ -132,7 +142,7 @@
         async function load() {
             const res = await fetch(API);
             if (!res.ok) {
-                setStatus("Failed to load settings (" + res.status + ")", false);
+                setStatus("Falha ao carregar (" + res.status + ")", false);
                 return;
             }
             const data = await res.json();
@@ -150,10 +160,11 @@
                 echoSizePx: Number(sizeSelect.value),
                 targetMetersPerPx: Number(targetMpp.value),
                 maxSizePx: Number(maxSizeSelect.value),
+                usableRadiusM: Number(usableNmInput.value) * NM,
                 usableBearingStartDeg: Number(bearingStart.value),
                 usableBearingEndDeg: Number(bearingEnd.value),
             };
-            setStatus("Saving…", null);
+            setStatus("Salvando…", null);
             const res = await fetch(API, {
                 method: "PUT",
                 headers: { "Content-Type": "application/json" },
@@ -161,11 +172,11 @@
             });
             const data = await res.json().catch(() => ({}));
             if (!res.ok) {
-                setStatus(data.message || ("Save failed (" + res.status + ")"), false);
+                setStatus(data.message || ("Falha ao salvar (" + res.status + ")"), false);
                 return;
             }
             applyData(data);
-            setStatus("Saved. Applied on the next echo / viewport frame.", true);
+            setStatus("Salvo. Aplicado no próximo quadro de eco / viewport.", true);
         });
 
         load().catch((e) => setStatus(String(e), false));

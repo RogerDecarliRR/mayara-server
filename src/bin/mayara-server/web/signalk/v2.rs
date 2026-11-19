@@ -667,6 +667,10 @@ struct GeoEchoApi {
     usable_bearing_start_deg: f64,
     #[schema(example = 360.0)]
     usable_bearing_end_deg: f64,
+    /// Operational usable radius (metres). Omit on PUT → follow compositionRangeM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = 25928.0)]
+    usable_radius_m: Option<f64>,
 }
 
 impl From<&GeoEchoConfig> for GeoEchoApi {
@@ -680,6 +684,8 @@ impl From<&GeoEchoConfig> for GeoEchoApi {
             max_viewport_range_m: cfg.max_viewport_range_m,
             usable_bearing_start_deg: cfg.usable_bearing_start_deg,
             usable_bearing_end_deg: cfg.usable_bearing_end_deg,
+            // Always expose the effective radius so clients see a concrete value.
+            usable_radius_m: Some(cfg.effective_usable_radius_m()),
         }
     }
 }
@@ -695,6 +701,7 @@ impl From<GeoEchoApi> for GeoEchoConfig {
             max_viewport_range_m: api.max_viewport_range_m,
             usable_bearing_start_deg: api.usable_bearing_start_deg,
             usable_bearing_end_deg: api.usable_bearing_end_deg,
+            usable_radius_m: api.usable_radius_m,
         }
     }
 }
@@ -749,17 +756,19 @@ async fn get_geo_echo(State(state): State<Web>) -> Response {
     put,
     path = "/signalk/v2/api/geo-echo",
     summary = "Update geo echo settings",
-    description = "Persists mode, compositionRangeM (50 m … 120 NM), optional \
-                   maxViewportRangeM (viewport range-step snap ceiling; default = \
-                   compositionRangeM), echoSizePx / maxSizePx (1024 | 2048 | 4096), \
-                   targetMetersPerPx, and usable bearing sector (0…360°, North=0 \
-                   clockwise; wraps when start>end).",
+    description = "Persists mode, compositionRangeM (50 m … 120 NM; canvas), \
+                   usableRadiusM (operational emission radius; omit → composition; \
+                   clamped ≤ composition), optional maxViewportRangeM (viewport \
+                   range-step snap ceiling; default = compositionRangeM), echoSizePx / \
+                   maxSizePx (1024 | 2048 | 4096), targetMetersPerPx, and usable \
+                   bearing sector (0…360°, North=0 clockwise; wraps when start>end).",
     request_body(content = GeoEchoApi, example = json!({
         "mode": "viewport",
         "compositionRangeM": 25928.0,
         "echoSizePx": 2048,
         "targetMetersPerPx": 2.0,
         "maxSizePx": 2048,
+        "usableRadiusM": 25928.0,
         "usableBearingStartDeg": 0.0,
         "usableBearingEndDeg": 360.0
     })),

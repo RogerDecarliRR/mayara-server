@@ -1193,7 +1193,7 @@ impl SharedRadars {
     /// Persist and apply geo-echo composition settings (next published frame).
     ///
     /// Also syncs Guard Zone 1 on every active radar to the ARPA acquisition
-    /// zone (usable bearings × composition range). Does **not** write
+    /// zone (usable bearings × usable radius). Does **not** write
     /// `ControlId::Range` — GUI zoom stays independent of composition.
     pub fn set_geo_echo_config(
         &self,

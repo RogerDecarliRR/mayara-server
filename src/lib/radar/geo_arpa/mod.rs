@@ -1,7 +1,7 @@
 //! Monitor-only ARPA feed (`geo-arpa.json`), independent of GUI Range / blob tracker.
 //!
-//! Coverage reuses [`crate::config::GeoEchoConfig`] (`compositionRangeM` × usable
-//! bearings). Lab source: emulator world contacts via
+//! Coverage reuses [`crate::config::GeoEchoConfig`] (`usableRadiusM` × usable
+//! bearings; composition is canvas only). Lab source: emulator world contacts via
 //! [`MonitorContactEnumerator`]. Hardware without an enumerator returns
 //! `available: false` and an empty target list.
 
