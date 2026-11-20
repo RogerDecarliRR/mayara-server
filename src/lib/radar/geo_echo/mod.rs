@@ -35,8 +35,8 @@ pub use png::{transparent_png, DEFAULT_ECHO_SIZE_PX};
 pub use polar_blob::{decode, encode, encode_snapshot, DecodedPolar, PolarBlobError};
 pub use polar_slots::PolarSlots;
 pub use raster::{
-    bearing_in_sector, effective_viewport_max_size_px, snap_size_hint_to_allowed,
-    view_range_from_bbox, view_spoke_coverage_m, viewport_size_px, BBox,
+    bearing_in_sector, deserialize_option_u32_lenient, effective_viewport_max_size_px,
+    snap_size_hint_to_allowed, view_range_from_bbox, view_spoke_coverage_m, viewport_size_px, BBox,
 };
 pub use remote_paint::{paint_viewport, ViewportPaintRequest, ViewportPaintResult};
 pub use renderer_client::{push_polar_snapshot, renderer_base_url};

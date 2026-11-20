@@ -2,7 +2,7 @@
 //! Polar double-buffer (W3 / A6): paint reads stable slot only.
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::{get, post, put};
@@ -10,7 +10,8 @@ use axum::{Json, Router};
 use clap::Parser;
 use mayara::config::GeoEchoConfig;
 use mayara::radar::geo_echo::{
-    paint_viewport, polar_blob, EchoFrame, EchoMeta, PolarSlots, ViewportPaintRequest,
+    deserialize_option_u32_lenient, paint_viewport, polar_blob, EchoFrame, EchoMeta, PolarSlots,
+    ViewportPaintRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -75,7 +76,12 @@ struct ViewportPost {
     #[serde(default)]
     max_viewport_range_m: Option<f64>,
     /// First-pan / low-res hint (`sizeHintPx` or alias `sizeHint`).
-    #[serde(default, alias = "sizeHint")]
+    /// Accepts JSON int or float (`1024` / `1024.0`); float is truncated.
+    #[serde(
+        default,
+        alias = "sizeHint",
+        deserialize_with = "deserialize_option_u32_lenient"
+    )]
     size_hint_px: Option<u32>,
 }
 
@@ -117,9 +123,15 @@ async fn main() {
         last_png: Arc::new(RwLock::new(None)),
     };
 
+    // MEPO polar ~0.5–2+ MB/rev (spokes×spoke_len); axum default 2 MiB → 413.
+    const POLAR_BODY_LIMIT: usize = 32 * 1024 * 1024;
+
     let app = Router::new()
         .route("/health", get(health))
-        .route("/v1/polar", put(put_polar))
+        .route(
+            "/v1/polar",
+            put(put_polar).layer(DefaultBodyLimit::max(POLAR_BODY_LIMIT)),
+        )
         .route("/v1/polar/meta", get(get_polar_meta))
         .route("/v1/viewport", post(post_viewport))
         .route("/v1/viewport.png", get(get_viewport_png))

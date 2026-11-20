@@ -71,6 +71,32 @@ pub fn snap_size_hint_to_allowed(hint: u32) -> u32 {
         .unwrap_or(GEO_ECHO_ALLOWED_SIZES[0])
 }
 
+/// Deserialize `Option<u32>` from a JSON number that may be int or float
+/// (`1024` or `1024.0`). Floats are truncated toward zero; negative / NaN /
+/// out-of-range → deserialize error. Missing / null → `None` (with `default`).
+pub fn deserialize_option_u32_lenient<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+    use serde::Deserialize;
+    let Some(n) = Option::<serde_json::Number>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    if let Some(u) = n.as_u64() {
+        return u32::try_from(u)
+            .map(Some)
+            .map_err(|_| D::Error::custom("sizeHintPx exceeds u32"));
+    }
+    if let Some(f) = n.as_f64() {
+        if !f.is_finite() || f < 0.0 || f > f64::from(u32::MAX) {
+            return Err(D::Error::custom("sizeHintPx out of range"));
+        }
+        return Ok(Some(f as u32));
+    }
+    Err(D::Error::custom("sizeHintPx must be a number"))
+}
+
 /// Effective max edge for paint: optional `sizeHint` caps `max_size_px`
 /// (RM-129 W2 A3/C1 — first pan at ~50% via client hint).
 pub fn effective_viewport_max_size_px(max_size_px: u32, size_hint: Option<u32>) -> u32 {
@@ -675,6 +701,27 @@ mod tests {
         assert_eq!(effective_viewport_max_size_px(2048, Some(1024)), 1024);
         assert_eq!(effective_viewport_max_size_px(2048, None), 2048);
         assert_eq!(effective_viewport_max_size_px(1024, Some(2048)), 1024); // never above cfg max
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct SizeHintProbe {
+        #[serde(default, deserialize_with = "deserialize_option_u32_lenient")]
+        size_hint_px: Option<u32>,
+    }
+
+    #[test]
+    fn size_hint_px_accepts_int_and_float() {
+        let int: SizeHintProbe = serde_json::from_str(r#"{"sizeHintPx":1024}"#).unwrap();
+        assert_eq!(int.size_hint_px, Some(1024));
+        let float: SizeHintProbe = serde_json::from_str(r#"{"sizeHintPx":1024.0}"#).unwrap();
+        assert_eq!(float.size_hint_px, Some(1024));
+        let trunc: SizeHintProbe = serde_json::from_str(r#"{"sizeHintPx":1024.9}"#).unwrap();
+        assert_eq!(trunc.size_hint_px, Some(1024));
+        let missing: SizeHintProbe = serde_json::from_str(r#"{}"#).unwrap();
+        assert_eq!(missing.size_hint_px, None);
+        let null: SizeHintProbe = serde_json::from_str(r#"{"sizeHintPx":null}"#).unwrap();
+        assert_eq!(null.size_hint_px, None);
     }
 
     #[test]

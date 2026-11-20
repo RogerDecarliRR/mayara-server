@@ -2,7 +2,7 @@
 
 use super::compositor::PolarSnapshot;
 use super::polar_blob;
-use log::debug;
+use log::warn;
 use std::sync::OnceLock;
 
 /// Base URL for the geo-echo-renderer process, or `None` when unset / empty.
@@ -32,6 +32,7 @@ fn http_client() -> &'static reqwest::Client {
 /// Fire-and-forget MEPO PUT to `{GEO_ECHO_RENDERER_URL}/v1/polar`.
 ///
 /// No-op when the env var is unset. Does not block the compositor loop.
+/// Spawns on the current Tokio runtime (compositor task); skips if none.
 pub fn push_polar_snapshot(snapshot: &PolarSnapshot) {
     let Some(base) = renderer_base_url() else {
         return;
@@ -39,13 +40,17 @@ pub fn push_polar_snapshot(snapshot: &PolarSnapshot) {
     let bytes = match polar_blob::encode_snapshot(snapshot) {
         Ok(b) => b,
         Err(e) => {
-            debug!("geo_echo renderer push: encode failed: {e}");
+            warn!("geo_echo renderer push: encode failed: {e}");
             return;
         }
     };
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        warn!("geo_echo renderer push: no Tokio runtime; skipping PUT");
+        return;
+    };
     let url = format!("{base}/v1/polar");
     let client = http_client().clone();
-    tokio::spawn(async move {
+    handle.spawn(async move {
         match client
             .put(&url)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
@@ -55,13 +60,13 @@ pub fn push_polar_snapshot(snapshot: &PolarSnapshot) {
         {
             Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 204 => {}
             Ok(resp) => {
-                debug!(
+                warn!(
                     "geo_echo renderer push: PUT {url} -> {}",
                     resp.status()
                 );
             }
             Err(e) => {
-                debug!("geo_echo renderer push: PUT {url} failed: {e}");
+                warn!("geo_echo renderer push: PUT {url} failed: {e}");
             }
         }
     });

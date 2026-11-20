@@ -723,7 +723,13 @@ struct ViewportRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     radar_lon: Option<f64>,
     /// Optional paint max edge (first pan ~50%); alias `sizeHint` accepted.
-    #[serde(default, alias = "sizeHint", skip_serializing_if = "Option::is_none")]
+    /// Accepts JSON int or float (`1024` / `1024.0`); float is truncated.
+    #[serde(
+        default,
+        alias = "sizeHint",
+        deserialize_with = "geo_echo::deserialize_option_u32_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     size_hint_px: Option<u32>,
 }
 
@@ -943,8 +949,11 @@ async fn post_echo_viewport(
         }
     };
 
-    // W1 D1: when GEO_ECHO_RENDERER_URL is set, forward paint (no local heavy fallback).
+    // W1 D1: when GEO_ECHO_RENDERER_URL is set, forward paint (no local heavy
+    // fallback). Still start the lazy compositor so polar snapshots are pushed
+    // to the renderer (`store_snapshot` → `push_polar_snapshot`).
     if let Some(base) = geo_echo::renderer_base_url() {
+        let _ = geo_echo::ensure_entry(&state.radars, &radar_id);
         return forward_echo_viewport(base, &radar_id, &request, &state.radars).await;
     }
 
@@ -2911,6 +2920,20 @@ mod tests {
                 "{status}"
             );
         }
+    }
+
+    #[test]
+    fn viewport_request_size_hint_px_accepts_float() {
+        let req: ViewportRequest = serde_json::from_str(
+            r#"{"west":-40.08,"south":-19.87,"east":-40.04,"north":-19.83,"sizeHintPx":1024.0}"#,
+        )
+        .expect("float sizeHintPx must deserialize");
+        assert_eq!(req.size_hint_px, Some(1024));
+        let alias: ViewportRequest = serde_json::from_str(
+            r#"{"west":-40.08,"south":-19.87,"east":-40.04,"north":-19.83,"sizeHint":2048.5}"#,
+        )
+        .expect("alias sizeHint float must deserialize");
+        assert_eq!(alias.size_hint_px, Some(2048));
     }
 
     /// A dual-range radar offers two entries, and clients that take the
