@@ -123,6 +123,11 @@ fn config_summary(args: &mayara::Cli) -> Value {
     obj.insert("transmit".into(), json!(args.transmit));
     obj.insert("stationary".into(), json!(args.stationary));
     obj.insert("emulator".into(), json!(args.emulator));
+    obj.insert("imevts_sim".into(), json!(args.imevts_sim_enabled()));
+    obj.insert(
+        "imevts_sim_port".into(),
+        json!(args.imevts_sim_listen_port()),
+    );
     obj.insert("replay".into(), json!(args.replay));
     obj.insert("nmea0183".into(), json!(args.nmea0183));
     obj.insert("navigation_address".into(), json!(args.navigation_address));

@@ -7,18 +7,21 @@ RUN printf 'precedence :ffff:0:0/96  100\n' > /etc/gai.conf
 # the Swagger UI bundle; without it the build fails with `curl command not
 # found`. `perl` is required by openssl-sys. `git` + CLI fetch: git deps in
 # Cargo.toml (nmea-parser / tokio-tungstenite) respect gai.conf.
-RUN apk add --no-cache build-base curl perl cmake git
+# Cache mount needs apk to write under /var/cache/apk — omit --no-cache.
+RUN --mount=type=cache,id=mayara-apk,target=/var/cache/apk \
+    apk add build-base curl perl cmake git
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 
 WORKDIR /usr/src/mayara-server
 
 # BuildKit cache mounts keep crates.io / git deps and `target/` across rebuilds
-# (even when Cargo.toml changes). The release binary is copied out of the
-# `target` mount into the image layer so the final stage can COPY it.
+# (even when Cargo.toml changes). Stable `id=` so prune type=regular does not
+# drop them. The release binary is copied out of the `target` mount into the
+# image layer so the final stage can COPY it.
 COPY Cargo.lock Cargo.toml build.rs ./
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/mayara-server/target \
+RUN --mount=type=cache,id=mayara-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=mayara-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=mayara-cargo-target,target=/usr/src/mayara-server/target \
     mkdir src && echo "fn main() {}" > src/main.rs \
     && cargo build --release 2>/dev/null || true \
     && rm -rf src
@@ -30,9 +33,9 @@ COPY src src/
 # unless its source file is present.
 COPY examples examples/
 COPY web web/
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/usr/src/mayara-server/target \
+RUN --mount=type=cache,id=mayara-cargo-registry,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=mayara-cargo-git,target=/usr/local/cargo/git \
+    --mount=type=cache,id=mayara-cargo-target,target=/usr/src/mayara-server/target \
     cargo build --release \
     && cp /usr/src/mayara-server/target/release/mayara-server /usr/src/mayara-server/mayara-server \
     && cp /usr/src/mayara-server/target/release/geo-echo-renderer /usr/src/mayara-server/geo-echo-renderer
@@ -42,8 +45,9 @@ LABEL org.opencontainers.image.source="https://github.com/MarineYachtRadar/mayar
 LABEL org.opencontainers.image.title="mayara-server"
 LABEL org.opencontainers.image.description="Marine radar server with REST API and WebSocket support"
 LABEL org.opencontainers.image.license="Apache-2.0"
-RUN printf 'precedence :ffff:0:0/96  100\n' > /etc/gai.conf \
-    && apk add --no-cache tini \
+RUN printf 'precedence :ffff:0:0/96  100\n' > /etc/gai.conf
+RUN --mount=type=cache,id=mayara-apk,target=/var/cache/apk \
+    apk add tini \
     && adduser -D -h /home/mayara mayara
 COPY --from=builder /usr/src/mayara-server/mayara-server /usr/local/bin/mayara-server
 COPY --from=builder /usr/src/mayara-server/geo-echo-renderer /usr/local/bin/geo-echo-renderer

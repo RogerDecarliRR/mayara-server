@@ -1062,6 +1062,8 @@ pub struct SharedRadars {
     /// Optional monitor-ARPA contact enumerators (emulator world), keyed by radar id.
     monitor_contact_enumerators:
         Arc<RwLock<HashMap<String, geo_arpa::MonitorContactEnumerator>>>,
+    /// ARPA tracker → geo-arpa contact snapshot (ImevtsSim / hardware).
+    monitor_contact_snapshot: geo_arpa::MonitorContactSnapshot,
 }
 
 impl Default for SharedRadars {
@@ -1084,7 +1086,23 @@ impl SharedRadars {
             })),
             viewport_world_samplers: Arc::new(RwLock::new(HashMap::new())),
             monitor_contact_enumerators: Arc::new(RwLock::new(HashMap::new())),
+            monitor_contact_snapshot: geo_arpa::empty_snapshot(),
         }
+    }
+
+    /// Shared snapshot filled by [`target::TrackerManager`] each revolution.
+    pub fn monitor_contact_snapshot(&self) -> geo_arpa::MonitorContactSnapshot {
+        Arc::clone(&self.monitor_contact_snapshot)
+    }
+
+    /// Register a geo-arpa enumerator that reads the ARPA tracker snapshot.
+    /// Used by ImevtsSim (and other brands without a world enumerator).
+    pub fn ensure_tracker_monitor_enumerator(&self, radar_id: &str) {
+        let enumerator = geo_arpa::enumerator_from_snapshot(
+            self.monitor_contact_snapshot(),
+            radar_id.to_string(),
+        );
+        self.set_monitor_contact_enumerator(radar_id, Some(enumerator));
     }
 
     /// Register (or clear) a geographic viewport echo sampler for `radar_id`.

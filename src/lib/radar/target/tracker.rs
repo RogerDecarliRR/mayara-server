@@ -176,6 +176,10 @@ pub struct TargetCandidate {
     pub position: GeoPosition,
     /// Size of the target in meters
     pub size_meters: f64,
+    /// Estimated LOA from blob extent (RM-132); None when invalid.
+    pub length_m: Option<f64>,
+    /// Estimated beam from blob extent; only with valid `length_m`.
+    pub beam_m: Option<f64>,
     /// Source radar key
     pub radar_key: String,
     /// Radar position (for bearing/distance calculation)
@@ -198,6 +202,10 @@ pub struct ActiveTarget {
     prev_position: Option<GeoPosition>,
     /// Current size estimate
     pub size_meters: f64,
+    /// Estimated LOA metres from latest blob extent (RM-132).
+    pub length_m: Option<f64>,
+    /// Estimated beam metres from latest blob extent.
+    pub beam_m: Option<f64>,
     /// Speed over ground (m/s), None until first update
     pub sog: Option<f64>,
     /// Course over ground (radians, 0 = North), None until first update
@@ -266,6 +274,8 @@ impl ActiveTarget {
             position: candidate.position,
             prev_position: Some(candidate.position), // Store for first COG calculation
             size_meters: candidate.size_meters,
+            length_m: candidate.length_m,
+            beam_m: candidate.beam_m,
             sog: None, // No speed until first update
             cog: None, // No course until first update
             motion_model,
@@ -352,6 +362,10 @@ impl ActiveTarget {
 
         self.position = candidate.position;
         self.size_meters = candidate.size_meters;
+        if candidate.length_m.is_some() && candidate.beam_m.is_some() {
+            self.length_m = candidate.length_m;
+            self.beam_m = candidate.beam_m;
+        }
         self.last_update = candidate.time;
         self.update_count += 1;
         self.last_radar_key = candidate.radar_key.clone();
@@ -1000,6 +1014,8 @@ mod tests {
             time,
             position: GeoPosition::new(lat, lon),
             size_meters: 30.0,
+            length_m: None,
+            beam_m: None,
             radar_key: "test".to_string(),
             radar_position: Some(GeoPosition::new(52.0, 4.0)),
             max_target_speed_ms: TEST_MAX_SPEED_MS,
@@ -2023,6 +2039,8 @@ mod tests {
             time,
             position: GeoPosition::new(lat, lon),
             size_meters: 30.0,
+            length_m: None,
+            beam_m: None,
             radar_key: "test".to_string(),
             radar_position: Some(GeoPosition::new(52.0, 4.0)),
             max_target_speed_ms: max_speed_ms,
@@ -2247,7 +2265,9 @@ mod tests {
                 time: i * 3000,
                 position: GeoPosition::new(52.0 + lat_step * i as f64, 4.0),
                 size_meters: 30.0,
-                radar_key: "test".to_string(),
+            length_m: None,
+            beam_m: None,
+            radar_key: "test".to_string(),
                 radar_position: radar,
                 max_target_speed_ms: max_speed_ms,
                 position_covariance: TEST_COV,
@@ -2263,7 +2283,9 @@ mod tests {
                 time: i * 3000,
                 position: GeoPosition::new(52.0, b_start_lon + lon_step * i as f64),
                 size_meters: 30.0,
-                radar_key: "test".to_string(),
+            length_m: None,
+            beam_m: None,
+            radar_key: "test".to_string(),
                 radar_position: radar,
                 max_target_speed_ms: max_speed_ms,
                 position_covariance: TEST_COV,
@@ -2321,7 +2343,9 @@ mod tests {
                 time: i * 3000,
                 position: GeoPosition::new(lat, start_lon + lon_step * i as f64),
                 size_meters: 30.0,
-                radar_key: "test".to_string(),
+            length_m: None,
+            beam_m: None,
+            radar_key: "test".to_string(),
                 radar_position: Some(GeoPosition::new(52.0, 4.0)),
                 max_target_speed_ms: max_speed_ms,
                 position_covariance: TEST_COV,
@@ -2345,6 +2369,8 @@ mod tests {
             time: 10 * 3000,
             position: GeoPosition::new(lat, last_lon - lon_step),
             size_meters: 30.0,
+            length_m: None,
+            beam_m: None,
             radar_key: "test".to_string(),
             radar_position: Some(GeoPosition::new(52.0, 4.0)),
             max_target_speed_ms: max_speed_ms,

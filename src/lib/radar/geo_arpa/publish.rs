@@ -20,6 +20,10 @@ pub struct MonitorContact {
     pub heading_deg: f64,
     /// Speed over ground in m/s.
     pub speed_m_s: f64,
+    /// Estimated LOA (m) from echo extent when valid (RM-132 / RM-102).
+    pub length_m: Option<f64>,
+    /// Estimated beam (m); omitted unless both dims pass validation.
+    pub beam_m: Option<f64>,
 }
 
 /// Callback that lists monitor contacts for a boat position and max range.
@@ -55,6 +59,12 @@ pub struct GeoArpaTarget {
     pub cog: f64,
     /// Speed over ground, m/s.
     pub sog: f64,
+    /// Estimated LOA metres (RM-132); omitted when unknown/invalid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length_m: Option<f64>,
+    /// Estimated beam metres; only with valid `length_m` (RM-102).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub beam_m: Option<f64>,
 }
 
 /// Contract for `GET …/geo-arpa.json` (camelCase).
@@ -126,6 +136,10 @@ pub fn publish_geo_arpa(radars: &SharedRadars, radar_id: &str) -> GeoArpaMeta {
         if !bearing_in_sector(bearing_deg, start, end) {
             continue;
         }
+        let (length_m, beam_m) = match (c.length_m, c.beam_m) {
+            (Some(l), Some(b)) if super::estimate::valid_dimensions(l, b) => (Some(l), Some(b)),
+            _ => (None, None),
+        };
         targets.push(GeoArpaTarget {
             id: c.id,
             bearing: c.bearing_rad,
@@ -134,6 +148,8 @@ pub fn publish_geo_arpa(radars: &SharedRadars, radar_id: &str) -> GeoArpaMeta {
             lon: Some(c.position.lon()),
             cog: c.heading_deg.to_radians(),
             sog: c.speed_m_s,
+            length_m,
+            beam_m,
         });
     }
 
@@ -202,6 +218,8 @@ mod tests {
                         distance_m,
                         heading_deg: 90.0,
                         speed_m_s: 2.0,
+                        length_m: None,
+                        beam_m: None,
                     })
                 })
                 .collect()
@@ -218,5 +236,32 @@ mod tests {
         assert!(d_near <= 1_000.0);
         assert!(bearing_in_sector(b_near.to_degrees(), 0.0, 360.0));
         assert!(!bearing_in_sector(b_near.to_degrees(), 90.0, 180.0));
+    }
+
+    #[test]
+    fn geo_arpa_target_serializes_optional_dims() {
+        let with_dims = GeoArpaTarget {
+            id: 1,
+            bearing: 0.0,
+            distance: 100.0,
+            lat: Some(0.0),
+            lon: Some(0.0),
+            cog: 0.0,
+            sog: 0.0,
+            length_m: Some(80.0),
+            beam_m: Some(12.0),
+        };
+        let json = serde_json::to_value(&with_dims).unwrap();
+        assert_eq!(json["lengthM"], 80.0);
+        assert_eq!(json["beamM"], 12.0);
+
+        let without = GeoArpaTarget {
+            length_m: None,
+            beam_m: None,
+            ..with_dims
+        };
+        let json2 = serde_json::to_value(&without).unwrap();
+        assert!(json2.get("lengthM").is_none());
+        assert!(json2.get("beamM").is_none());
     }
 }

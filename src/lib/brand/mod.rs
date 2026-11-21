@@ -10,6 +10,7 @@ use tokio_graceful_shutdown::SubsystemHandle;
 pub(crate) mod emulator;
 #[cfg(feature = "furuno")]
 pub(crate) mod furuno;
+pub(crate) mod imevts_sim;
 #[cfg(feature = "garmin")]
 pub(crate) mod garmin;
 #[cfg(feature = "koden")]
@@ -43,6 +44,12 @@ pub(crate) fn create_brand_listeners(
     brands: &mut HashSet<Brand>,
     args: &Cli,
 ) {
+    // ImevtsSim has no multicast locator; the UDP listener starts from the
+    // locator subsystem when enabled. Still record the brand for status.
+    if args.imevts_sim_enabled() {
+        brands.insert(Brand::ImevtsSim);
+    }
+
     // When emulator mode is enabled, skip all real radar brands
     #[cfg(feature = "emulator")]
     if args.emulator {

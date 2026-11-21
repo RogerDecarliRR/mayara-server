@@ -1,6 +1,7 @@
-# Lab local imevts: imagem mayara-server:local (--emulator) na 6502 + geo-echo-renderer na 6503.
+# Lab local imevts: imagem mayara-server:local (--emulator + --imevts-sim) na 6502
+# + geo-echo-renderer na 6503 + UDP IMRS 6510 (FK-3.1 / RM-124).
 # Subir: ../scripts/dev/up-local.sh
-# FK-1 smoke: só --emulator (cenário embutido HALO). static-position porto só com land/marks ou RM-124.
+# FK-1 smoke: --emulator (cenário embutido HALO). IMRS: sim imevts → UDP 6510 → brand ImevtsSim.
 # Config/share em named volumes (sobrevivem recreate/rebuild); tmpfs só em /tmp.
 services:
   mayara-server:
@@ -12,9 +13,12 @@ services:
       # container IPv6 → crates.io / GitHub timeouts).
       network: host
     image: mayara-server:local
-    command: ["mayara-server", "--emulator"]
+    # --emulator HALO + --imevts-sim (UDP IMRS from imevts sim; both coexist).
+    command: ["mayara-server", "--emulator", "--imevts-sim"]
     ports:
       - "${MAYARA_HOST_PORT:-6502}:6502"
+      # FK-3.1 / RM-124: IMRS spoke datagrams from imevts sim (default host 6510/udp).
+      - "${MAYARA_IMEVTS_SIM_HOST_PORT:-6510}:6510/udp"
     environment:
       GEO_ECHO_RENDERER_URL: http://geo-echo-renderer:6503
     networks:

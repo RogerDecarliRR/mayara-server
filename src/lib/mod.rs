@@ -215,6 +215,17 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub emulator: bool,
 
+    /// Listen for UDP IMRS spokes from the imevts simulator (lab, RM-124).
+    /// Can coexist with `--emulator`. Also enabled when env `MAYARA_IMEVTS_SIM`
+    /// is set to a non-empty value other than `0`.
+    #[arg(long, default_value_t = false)]
+    pub imevts_sim: bool,
+
+    /// UDP port for `--imevts-sim` (default 6510). Env `MAYARA_IMEVTS_SIM_PORT`
+    /// overrides when set to a valid u16.
+    #[arg(long, default_value_t = 6510)]
+    pub imevts_sim_port: u16,
+
     /// Make the emulator send only one in four of the spokes it reports, as a
     /// radar with sparse spokes such as a Furuno does
     #[arg(long, default_value_t = false, requires = "emulator")]
@@ -302,6 +313,28 @@ impl Cli {
             return true;
         }
         self.replay
+    }
+
+    /// `--imevts-sim` or env `MAYARA_IMEVTS_SIM` (non-empty, not `0`).
+    pub fn imevts_sim_enabled(&self) -> bool {
+        if self.imevts_sim {
+            return true;
+        }
+        match std::env::var("MAYARA_IMEVTS_SIM") {
+            Ok(v) => {
+                let t = v.trim();
+                !t.is_empty() && t != "0"
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// Listen port for IMRS: env `MAYARA_IMEVTS_SIM_PORT` if valid, else CLI.
+    pub fn imevts_sim_listen_port(&self) -> u16 {
+        std::env::var("MAYARA_IMEVTS_SIM_PORT")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(self.imevts_sim_port)
     }
 
     /// Returns the pcap file path if `--pcap <file>` was specified.
@@ -418,6 +451,8 @@ pub enum Brand {
     Raymarine,
     Emulator,
     Playback,
+    /// UDP IMRS from the imevts simulator (lab, RM-124). Always compiled in.
+    ImevtsSim,
 }
 
 impl Brand {
@@ -431,6 +466,7 @@ impl Brand {
             Self::Raymarine => "ray",
             Self::Emulator => "emu",
             Self::Playback => "play",
+            Self::ImevtsSim => "ims",
         }
     }
 
@@ -446,7 +482,7 @@ impl Brand {
             Self::Onwa => cfg!(feature = "onwa"),
             Self::Raymarine => cfg!(feature = "raymarine"),
             Self::Emulator => cfg!(feature = "emulator"),
-            Self::Playback => true,
+            Self::Playback | Self::ImevtsSim => true,
         }
     }
 
@@ -479,6 +515,7 @@ impl Brand {
             Self::Raymarine,
             Self::Emulator,
             Self::Playback,
+            Self::ImevtsSim,
         ]
         .into_iter()
         .find(|brand| key.starts_with(brand.to_prefix()))
@@ -496,6 +533,7 @@ impl From<&str> for Brand {
             "raymarine" => Brand::Raymarine,
             "emulator" => Brand::Emulator,
             "playback" => Brand::Playback,
+            "imevtssim" | "imevts-sim" | "imevts_sim" => Brand::ImevtsSim,
             _ => panic!("Invalid brand"),
         }
     }
@@ -515,6 +553,7 @@ impl Serialize for Brand {
             Self::Raymarine => serializer.serialize_str("Raymarine"),
             Self::Emulator => serializer.serialize_str("Emulator"),
             Self::Playback => serializer.serialize_str("Playback"),
+            Self::ImevtsSim => serializer.serialize_str("ImevtsSim"),
         }
     }
 }
@@ -530,6 +569,7 @@ impl std::fmt::Display for Brand {
             Self::Raymarine => write!(f, "Raymarine"),
             Self::Emulator => write!(f, "Emulator"),
             Self::Playback => write!(f, "Playback"),
+            Self::ImevtsSim => write!(f, "ImevtsSim"),
         }
     }
 }
@@ -897,7 +937,11 @@ pub async fn start_session(
         radars.set_arpa_tx(arpa_tx);
 
         let sk_client_tx = radars.get_sk_client_tx();
-        let (tracker_manager, command_tx) = TrackerManager::new(args.merge_targets, sk_client_tx);
+        let (tracker_manager, command_tx) = TrackerManager::new(
+            args.merge_targets,
+            sk_client_tx,
+            radars.monitor_contact_snapshot(),
+        );
         radars.set_tracker_command_tx(command_tx);
 
         subsystem.start(SubsystemBuilder::new(

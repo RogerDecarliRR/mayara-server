@@ -83,9 +83,12 @@ impl From<&RadarInfo> for RadarIdentity {
     }
 }
 
-/// Emulated and recorded radars say nothing about real hardware working.
+/// Emulated, simulated and recorded radars say nothing about real hardware working.
 fn is_real_radar(brand: Brand) -> bool {
-    !matches!(brand, Brand::Emulator | Brand::Playback)
+    !matches!(
+        brand,
+        Brand::Emulator | Brand::Playback | Brand::ImevtsSim
+    )
 }
 
 /// Whether this caller gets to send the milestone `flag` stands for. Consent
@@ -637,6 +640,7 @@ mod tests {
 
         assert!(!claim_once(&spokes, Brand::Emulator));
         assert!(!claim_once(&spokes, Brand::Playback));
+        assert!(!claim_once(&spokes, Brand::ImevtsSim));
         // A real radar in the same run can still report.
         assert!(claim_once(&spokes, Brand::Navico));
     }

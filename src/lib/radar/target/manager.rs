@@ -165,6 +165,8 @@ pub struct TrackerManager {
     /// deleted. That mirrors the GUI's audible alert, which is likewise
     /// driven by acquisition.
     guard_zone_alarm: HashMap<String, [bool; GUARD_ZONE_COUNT as usize]>,
+    /// Snapshot of shown tracks for `geo-arpa` (ImevtsSim / hardware ARPA).
+    monitor_snapshot: crate::radar::geo_arpa::MonitorContactSnapshot,
 }
 
 impl TrackerManager {
@@ -172,6 +174,7 @@ impl TrackerManager {
     pub fn new(
         merge_mode: bool,
         sk_client_tx: broadcast::Sender<SignalKDelta>,
+        monitor_snapshot: crate::radar::geo_arpa::MonitorContactSnapshot,
     ) -> (Self, mpsc::Sender<TrackerCommand>) {
         let (command_tx, command_rx) = mpsc::channel(32);
 
@@ -189,6 +192,7 @@ impl TrackerManager {
             command_rx,
             merged_clock: None,
             guard_zone_alarm: HashMap::new(),
+            monitor_snapshot,
         };
 
         (manager, command_tx)
@@ -365,11 +369,27 @@ impl TrackerManager {
             CandidateSource::Anywhere
         };
 
+        let distance_m = blob_to_polar(&msg.blob, ctx).map(|(_, d)| d).unwrap_or(0.0);
+        let dims = crate::radar::geo_arpa::estimate_dims_from_blob_extent(
+            msg.blob.pixel_extent,
+            msg.blob.spoke_extent,
+            ctx.range as f64,
+            ctx.spoke_len,
+            ctx.spokes_per_revolution,
+            distance_m,
+        );
+        let (length_m, beam_m) = match dims {
+            Some((l, b)) => (Some(l), Some(b)),
+            None => (None, None),
+        };
+
         // Create target candidate
         let candidate = TargetCandidate {
             time: ctx.time,
             position,
             size_meters: msg.blob.size_meters,
+            length_m,
+            beam_m,
             radar_key: msg.radar_key.clone(),
             radar_position,
             max_target_speed_ms: ctx.max_target_speed_ms,
@@ -516,6 +536,47 @@ impl TrackerManager {
         // Every timeout counts revolutions, so this is when one can expire.
         self.check_all_timeouts();
         self.broadcast_all_targets(radar_key, radar_position.as_ref());
+        self.refresh_monitor_snapshot(radar_key, radar_position.as_ref());
+    }
+
+    /// Publish shown tracks into the geo-arpa snapshot for `radar_key`.
+    fn refresh_monitor_snapshot(
+        &self,
+        radar_key: &str,
+        radar_position: Option<&GeoPosition>,
+    ) {
+        let merge_mode = self.merge_mode;
+        let trackers: Vec<&TargetTracker> = if merge_mode {
+            self.shared_tracker.iter().collect()
+        } else {
+            self.per_radar_trackers
+                .get(radar_key)
+                .into_iter()
+                .collect()
+        };
+        let mut contacts = Vec::new();
+        for tracker in trackers {
+            for target in tracker.get_active_targets() {
+                if !target.is_shown() || target.status == TargetStatus::Lost {
+                    continue;
+                }
+                if !merge_mode && target.last_radar_key != radar_key {
+                    continue;
+                }
+                let heading_deg = target.cog.map(|r| r.to_degrees()).unwrap_or(0.0);
+                let speed = target.sog.unwrap_or(0.0);
+                contacts.push(crate::radar::geo_arpa::contact_from_track(
+                    target.id,
+                    target.position,
+                    radar_position,
+                    heading_deg,
+                    speed,
+                    target.length_m,
+                    target.beam_m,
+                ));
+            }
+        }
+        crate::radar::geo_arpa::store_contacts(&self.monitor_snapshot, radar_key, contacts);
     }
 
     /// Whether `radar_key` may advance the shared tracker's clock.
@@ -581,6 +642,8 @@ impl TrackerManager {
             time: request.time,
             position: request.position,
             size_meters: request.size_meters,
+            length_m: None,
+            beam_m: None,
             radar_key: request.radar_key.clone(),
             radar_position: request.radar_position,
             max_target_speed_ms: SpokeContext::max_speed_from_mode(2), // Fast mode for MARPA
@@ -1083,7 +1146,7 @@ mod tests {
 
     fn make_test_manager(merge_mode: bool) -> TrackerManager {
         let (sk_tx, _rx) = broadcast::channel(16);
-        let (manager, _command_tx) = TrackerManager::new(merge_mode, sk_tx);
+        let (manager, _command_tx) = TrackerManager::new(merge_mode, sk_tx, crate::radar::geo_arpa::empty_snapshot());
         manager
     }
 
@@ -1494,6 +1557,8 @@ mod tests {
             time: 1000,
             position: GeoPosition::new(52.001, 4.001),
             size_meters: 30.0,
+            length_m: None,
+            beam_m: None,
             radar_key: "test".to_string(),
             radar_position: Some(radar_pos),
             max_target_speed_ms: max_speed,
@@ -1509,7 +1574,9 @@ mod tests {
                 time: 1000 + i * 3000,
                 position: GeoPosition::new(52.001 + i as f64 * 0.0001, 4.001),
                 size_meters: 30.0,
-                radar_key: "test".to_string(),
+            length_m: None,
+            beam_m: None,
+            radar_key: "test".to_string(),
                 radar_position: Some(radar_pos),
                 max_target_speed_ms: max_speed,
                 position_covariance: TEST_COV,
@@ -1571,7 +1638,7 @@ mod tests {
         tokio::sync::broadcast::Receiver<SignalKDelta>,
     ) {
         let (sk_tx, sk_rx) = broadcast::channel(64);
-        let (manager, _command_tx) = TrackerManager::new(merge_mode, sk_tx);
+        let (manager, _command_tx) = TrackerManager::new(merge_mode, sk_tx, crate::radar::geo_arpa::empty_snapshot());
         (manager, sk_rx)
     }
 
@@ -1990,7 +2057,7 @@ mod tests {
     #[tokio::test]
     async fn a_marpa_command_is_answered_with_the_new_target_id() {
         let (sk_tx, _sk_rx) = broadcast::channel(16);
-        let (manager, command_tx) = TrackerManager::new(false, sk_tx);
+        let (manager, command_tx) = TrackerManager::new(false, sk_tx, crate::radar::geo_arpa::empty_snapshot());
         let (_tracker_tx, tracker_rx) = mpsc::channel(1);
         tokio::spawn(manager.run(tracker_rx));
 
@@ -2364,7 +2431,9 @@ mod tests {
                 time: i * 3000,
                 position: GeoPosition::new(start_lat - lat_step * i as f64, 4.0),
                 size_meters: 30.0,
-                radar_key: "test".to_string(),
+            length_m: None,
+            beam_m: None,
+            radar_key: "test".to_string(),
                 radar_position: Some(radar_pos),
                 max_target_speed_ms: max_speed,
                 position_covariance: TEST_COV,
@@ -2383,6 +2452,8 @@ mod tests {
             time: 6 * 3000,
             position: GeoPosition::new(noisy_true_lat, noisy_true_lon),
             size_meters: 30.0,
+            length_m: None,
+            beam_m: None,
             radar_key: "test".to_string(),
             radar_position: Some(radar_pos),
             max_target_speed_ms: max_speed,

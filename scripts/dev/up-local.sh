@@ -29,14 +29,19 @@ Uso: ./scripts/dev/up-local.sh [--build] [-h|--help]
   o código Mayara for estendido (RM-124 / docs/lps/FJ-mayara-radar.md).
 
 Opções:
-  --build       Rebuild a partir do Dockerfile deste clone (Rust/Alpine; lento).
+  --build       Rebuild a partir do Dockerfile deste clone (Rust/Alpine).
+                Reusa cache BuildKit (apk + cargo registry/git/target).
                 Necessário após mudar o código do emulator no fork.
+                Env: MAYARA_BUILD_CACHE_KEEP (default 8GB) — teto
+                (--max-used-space) do layer cache regular após o rebuild
+                (cache mounts cargo/apk ficam).
   -h, --help    Mostra esta ajuda.
 
 Comportamento:
   - Running + /signalk OK → sai (idempotente).
   - Sem imagem local → docker pull GHCR e tag mayara-server:local (rápido).
-  - --build → docker compose up -d --build (só quando quiseres compilar o clone).
+  - --build → docker compose up -d --build; depois só fica mayara-server:local
+    atual (dangling images fora); NÃO apaga cache mounts cargo.
 EOF
 }
 
@@ -71,8 +76,8 @@ print_footer() {
   echo "Parar:     ./scripts/dev/down-local.sh"
   echo
   echo "Auto-start: restart=unless-stopped — com docker.service enabled, o container volta ao abrir WSL."
-  echo "Rebuild:    ./scripts/dev/up-local.sh --build"
-  echo "Nota:       primeiro build Rust pode demorar vários minutos."
+  echo "Rebuild:    ./scripts/dev/up-local.sh --build  (reusa BuildKit; só :local atual fica)"
+  echo "Nota:       primeiro build Rust pode demorar; rebuilds seguintes reusam apk/cargo."
 }
 
 while [[ $# -gt 0 ]]; do
@@ -112,16 +117,18 @@ fi
 
 if (( FORCE_BUILD )); then
   export DOCKER_BUILDKIT=1
-  echo "==> docker compose up -d --build (Dockerfile do clone; Rust/Alpine; build network=host + IPv4 preferido; pode demorar) …"
+  export COMPOSE_DOCKER_CLI_BUILD=1
+  KEEP_STORAGE="${MAYARA_BUILD_CACHE_KEEP:-8GB}"
+  echo "==> docker compose up -d --build (BuildKit; reusa apk/cargo cache; network=host + IPv4; pode demorar) …"
   if ! compose up -d --build; then
     compose_fail_hint
     exit 1
   fi
-  # Imagem :local nova → ID velho dangling; layers reclaimable fora. Mantém
-  # cache mounts cargo (builder prune sem -a). Mesma ideia que imevts_docker_drop_superseded.
+  # Imagem :local nova → ID velho dangling fora. Layer cache regular: teto
+  # max-used-space (Docker ≥29); nunca -a — cache mounts cargo/apk ficam.
   docker image prune -f >/dev/null 2>&1 || true
-  docker builder prune -f >/dev/null 2>&1 || true
-  echo "==> drop-superseded: dangling images + build cache órfão limpos (cache mount cargo mantido)"
+  docker builder prune -f --filter type=regular --max-used-space="$KEEP_STORAGE" >/dev/null 2>&1 || true
+  echo "==> drop-superseded: dangling images limpas; builder prune regular max-used-space=${KEEP_STORAGE} (cache mounts cargo/apk mantidos)"
 else
   ensure_local_image
   echo "==> docker compose up -d (sem rebuild; --build só para compilar o clone) …"

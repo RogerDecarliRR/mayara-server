@@ -686,11 +686,21 @@ impl EmulatorWorld {
                     id: u64,
                     pos: GeoPosition,
                     heading_deg: f64,
-                    speed_m_s: f64| {
+                    speed_m_s: f64,
+                    echo_radius_m: f64| {
             if !in_range(&pos) {
                 return;
             }
             let (distance_m, bearing_rad) = distance_and_bearing(boat_pos, &pos);
+            // Circular echo → equal spans → helper omits (no invented aspect).
+            let dims = crate::radar::geo_arpa::estimate_dims_from_spans(
+                2.0 * echo_radius_m,
+                2.0 * echo_radius_m,
+            );
+            let (length_m, beam_m) = match dims {
+                Some((l, b)) => (Some(l), Some(b)),
+                None => (None, None),
+            };
             out.push(MonitorContact {
                 id,
                 position: pos,
@@ -698,6 +708,8 @@ impl EmulatorWorld {
                 distance_m,
                 heading_deg,
                 speed_m_s,
+                length_m,
+                beam_m,
             });
         };
 
@@ -709,6 +721,7 @@ impl EmulatorWorld {
                     t.position,
                     t.heading,
                     t.speed,
+                    TARGET_RADIUS,
                 );
             }
             for (i, t) in self.crossing_targets.iter().enumerate() {
@@ -718,6 +731,7 @@ impl EmulatorWorld {
                     t.position,
                     t.heading,
                     t.speed,
+                    TARGET_RADIUS,
                 );
             }
             for (i, t) in self.fast_targets.iter().enumerate() {
@@ -727,6 +741,7 @@ impl EmulatorWorld {
                     t.position,
                     t.heading,
                     t.speed,
+                    TARGET_RADIUS,
                 );
             }
             let speed_m_s =
@@ -737,16 +752,19 @@ impl EmulatorWorld {
                 self.circling_target.position,
                 self.circling_target.heading,
                 speed_m_s,
+                TARGET_RADIUS,
             );
         }
 
         for echo in &self.ais {
+            // Echo radius only (circular) — never AIS LOA/beam truth (RM-132).
             push(
                 &mut out,
                 stable_contact_id(NS_AIS, ais_contact_key(&echo.mmsi)),
                 echo.target.position,
                 echo.target.heading,
                 echo.target.speed,
+                echo.radius,
             );
         }
 

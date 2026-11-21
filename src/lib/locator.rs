@@ -123,6 +123,12 @@ impl Locator {
     ) -> Result<(), RadarError> {
         let radars = &self.radars;
 
+        // FK-3.1 / RM-124: UDP IMRS from imevts sim (can coexist with --emulator).
+        if self.args.imevts_sim_enabled() {
+            log::info!("ImevtsSim mode: starting IMRS UDP listener");
+            crate::brand::imevts_sim::start(&self.args, radars, subsys);
+        }
+
         // Handle emulator mode - create radar directly without network discovery
         #[cfg(feature = "emulator")]
         if self.args.emulator {
@@ -133,7 +139,7 @@ impl Locator {
             // event we could observe here, so just await the shutdown
             // signal directly instead of a single-arm select! inside a
             // loop (which clippy correctly flags as a loop that never
-            // actually loops).
+            // actually loops). ImevtsSim (if enabled) already spawned above.
             subsys.on_shutdown_requested().await;
             log::debug!("Emulator locator shutdown");
             return Ok(());
