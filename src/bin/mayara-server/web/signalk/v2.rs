@@ -1752,6 +1752,15 @@ async fn acquire_target(
         }
     };
 
+    // Shore/stationary radars use their fixed antenna, not Emulator own-ship.
+    let resolve_radar_pos = || {
+        if radar.stationary {
+            radar.antenna_position().or_else(navdata::get_radar_position)
+        } else {
+            navdata::get_radar_position()
+        }
+    };
+
     // Compute target position from either lat/lon or bearing/distance
     let position = match (
         request.latitude,
@@ -1765,7 +1774,7 @@ async fn acquire_target(
         }
         (_, _, Some(bearing), Some(distance)) => {
             // Bearing/distance from radar - need radar position
-            let radar_pos = match navdata::get_radar_position() {
+            let radar_pos = match resolve_radar_pos() {
                 Some(pos) => pos,
                 None => {
                     return SignalKResponse::failed(
@@ -1784,8 +1793,8 @@ async fn acquire_target(
         }
     };
 
-    // Get radar position for API conversion (bearing/distance calculation)
-    let radar_position = navdata::get_radar_position();
+    // Radar position for MARPA (bearing/distance / relative→absolute)
+    let radar_position = resolve_radar_pos();
 
     // Create MARPA request
     let marpa_request = MarpaRequest {
@@ -1851,12 +1860,18 @@ async fn get_targets(Path(radar_id): Path<String>, State(state): State<Web>) -> 
     log::debug!("Get targets for radar {}", radar_id);
 
     // Verify radar exists
-    if state.radars.get_by_key(&radar_id).is_none() {
+    let Some(radar) = state.radars.get_by_key(&radar_id) else {
         return no_such_radar(&radar_id, &state.radars);
-    }
+    };
 
-    // Get current radar position from navigation data
-    let radar_position = navdata::get_radar_position();
+    // Shore/stationary: antenna of this radar; else own-ship nav (same as acquire_target).
+    let radar_position = if radar.stationary {
+        radar
+            .antenna_position()
+            .or_else(navdata::get_radar_position)
+    } else {
+        navdata::get_radar_position()
+    };
 
     // Get tracker command channel
     let command_tx = match state.radars.get_tracker_command_tx() {

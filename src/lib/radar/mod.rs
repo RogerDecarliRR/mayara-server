@@ -458,6 +458,10 @@ pub struct RadarInfo {
     pub dual_range: bool,                // Is it dual range capable?
     pub sparse_spokes: bool,             // Does it produce fewer spokes than spokes_per_revolution?
     pub stationary: bool,                // Is radar stationary (shore-based)?
+    /// Fixed antenna WGS84 when [`Self::stationary`] (shore / ImevtsSim asset).
+    /// Overrides own-ship pose for spoke georef and MARPA when both are set.
+    pub antenna_lat: Option<f64>,
+    pub antenna_lon: Option<f64>,
     rotation_timestamp: Instant,
 
     /// The address the radar was keyed by before it had a hardware
@@ -691,6 +695,8 @@ impl RadarInfo {
             dual_range: false,
             sparse_spokes,
             stationary: args.stationary,
+            antenna_lat: None,
+            antenna_lon: None,
             rotation_timestamp: Instant::now() - Duration::from_secs(2),
             // Start non-idle so the first ~5s of operation always processes
             // frames; the data_loop's periodic re-check will flip it once
@@ -803,6 +809,14 @@ impl RadarInfo {
             .as_deref()
             .and_then(|dual| self.key.strip_suffix(dual))
             .unwrap_or(&self.key)
+    }
+
+    /// Fixed antenna position when both `antenna_lat` and `antenna_lon` are set.
+    pub fn antenna_position(&self) -> Option<GeoPosition> {
+        match (self.antenna_lat, self.antenna_lon) {
+            (Some(lat), Some(lon)) => Some(GeoPosition::new(lat, lon)),
+            _ => None,
+        }
     }
 
     /// Recompute the idle flag from this radar's live power state and spoke
@@ -2606,7 +2620,10 @@ impl CommonRadar {
         //     revolution into one broadcast).
         // In both cases this spoke belongs to a fresh batch.
         let range_changed = self.batch_range.is_some_and(|r| r != range);
-        let rev_wrapped = angle < self.prev_angle && self.spoke_message.is_some();
+        // Detect wrap by angle alone. Requiring spoke_message.is_some() misses
+        // the wrap when the previous flush emptied the batch (e.g. spokes %
+        // batch_threshold == 0) → spoke_count never resets → Spokes TooHigh panic.
+        let rev_wrapped = angle < self.prev_angle;
         if rev_wrapped {
             // Publish per-revolution stats describing the rev that just
             // finished, before the batch carrying them is flushed.
@@ -2634,13 +2651,24 @@ impl CommonRadar {
             if self.blob_detector.is_some()
                 && let Some(ref arpa_tx) = self.arpa_tx
             {
-                let (lat, lon) = spoke::own_ship_position();
-                let tick = TrackerInput::Revolution {
-                    radar_key: self.key.clone(),
-                    radar_position: match (lat, lon) {
+                let radar_position = if self.info.stationary {
+                    self.info.antenna_position().or_else(|| {
+                        let (lat, lon) = spoke::own_ship_position();
+                        match (lat, lon) {
+                            (Some(lat), Some(lon)) => Some(GeoPosition::new(lat, lon)),
+                            _ => None,
+                        }
+                    })
+                } else {
+                    let (lat, lon) = spoke::own_ship_position();
+                    match (lat, lon) {
                         (Some(lat), Some(lon)) => Some(GeoPosition::new(lat, lon)),
                         _ => None,
-                    },
+                    }
+                };
+                let tick = TrackerInput::Revolution {
+                    radar_key: self.key.clone(),
+                    radar_position,
                 };
                 // A dropped blob costs one echo; a dropped tick slows the
                 // clock itself, so say so rather than losing it silently.
@@ -2700,6 +2728,14 @@ impl CommonRadar {
                 Some(self.spoke_time),
                 generic_spoke,
             );
+            // Shore / ImevtsSim: georef blobs at the fixed antenna, not the
+            // Emulator boat pose that to_protobuf_spoke reads from navdata.
+            if self.info.stationary
+                && let Some(pos) = self.info.antenna_position()
+            {
+                spoke.lat = Some(pos.lat());
+                spoke.lon = Some(pos.lon());
+            }
             apply_antenna_offset(
                 &mut spoke,
                 &self.info.controls,
@@ -3753,6 +3789,26 @@ mod tests {
                 sparse_spokes,
             )
         }
+    }
+
+    #[test]
+    fn antenna_position_requires_both_coords_and_stationary_flag() {
+        let radars = SharedRadars::new();
+        let mut info = test_helpers::radar_info(&radars, "ANT", None);
+        assert!(info.antenna_position().is_none());
+        assert!(!info.stationary);
+
+        info.antenna_lat = Some(-19.85);
+        assert!(info.antenna_position().is_none());
+
+        info.antenna_lon = Some(-40.12);
+        let pos = info.antenna_position().expect("both coords");
+        assert!((pos.lat() - (-19.85)).abs() < 1e-9);
+        assert!((pos.lon() - (-40.12)).abs() < 1e-9);
+
+        info.stationary = true;
+        assert!(info.stationary);
+        assert!(info.antenna_position().is_some());
     }
 
     /// Only a radar that skips spokes offers a way to process them; setting

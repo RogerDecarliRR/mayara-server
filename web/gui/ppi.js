@@ -201,6 +201,9 @@ class PPI {
     this.headingCos = null;
     this.headingMode = "headingUp";
     this.trueHeading = null;
+    // Shore / fixed antenna (ImevtsSim porto): north-up only. Emulator
+    // navigation.headingTrue must not drive H Up — it spins ARPA.
+    this.stationary = false;
     // Last display row written in north-up mode and the relative angle it
     // belonged to (both reported-spoke units); used to fill the
     // heading-induced part of forward display gaps.
@@ -445,12 +448,28 @@ class PPI {
     return (this.spoke_range * this.maxspokelength) / this.spoke_length;
   }
 
+  // Shore radar = north-up only; H Up from the Emulator misaligns ARPA.
+  setStationary(on) {
+    this.stationary = !!on;
+    if (!this.stationary) return this.headingMode;
+    // Fixed north reference; drop any Emulator heading / smoother state.
+    this.trueHeading = null;
+    this.headingSin = null;
+    this.headingCos = null;
+    return this.setHeadingMode("northUp");
+  }
+
   setHeadingMode(mode) {
+    // Shore / stationary: reject H Up (heading 0 ≡ N Up visually).
+    if (this.stationary && mode === "headingUp") {
+      mode = "northUp";
+    }
     if (mode === this.headingMode) {
       return mode;
     }
     // North-up needs a heading; reverting to head-up must always work
     // (it is the forced fallback when the heading source dies).
+    // Stationary: hasHeading() is true with north=0 even before spokes.
     if (mode === "northUp" && !this.hasHeading()) {
       return "headingUp";
     }
@@ -475,6 +494,8 @@ class PPI {
   }
 
   setTrueHeading(heading) {
+    // Stationary: ignore Emulator / Signal K heading (north is fixed).
+    if (this.stationary) return;
     this.trueHeading = heading;
     this.#maybeRefreshOverlayForHeading();
   }
@@ -503,6 +524,9 @@ class PPI {
   // (better than nothing on boats with no other source). Null when no
   // source exists.
   #displayHeadingRad() {
+    // Stationary shore radar: always north (0). Never fall through to
+    // Emulator navigation.headingTrue — that spins the ARPA overlay.
+    if (this.stationary) return 0;
     if (this.#radarHeadingFresh()) return (this.lastHeading * Math.PI) / 180;
     if (this.trueHeading !== null) return this.trueHeading;
     if (this.lastHeading !== null) return (this.lastHeading * Math.PI) / 180;
@@ -516,6 +540,7 @@ class PPI {
   // radar fed a magnetic or misaligned heading doesn't drag the AIS
   // overlay with it. Null when no source is available.
   #trueHeadingRad() {
+    if (this.stationary) return 0;
     if (this.trueHeading !== null) return this.trueHeading;
     return this.#displayHeadingRad();
   }
@@ -583,7 +608,9 @@ class PPI {
   // True when any heading reference is available — the SignalK true
   // heading or the radar-derived heading. AIS placement needs one of
   // these; the UI grays the AIS toggle when neither is present.
+  // Stationary: fixed north is enough for N Up (heading 0 counts).
   hasHeading() {
+    if (this.stationary) return true;
     return this.trueHeading !== null || this.lastHeading !== null;
   }
 

@@ -111,18 +111,40 @@ pub fn distance_and_bearing(from: &GeoPosition, to: &GeoPosition) -> (f64, f64) 
     (distance, bearing)
 }
 
+/// Reference pose for recomputing contact range/bearing in geo-arpa publish.
+///
+/// Shore / ImevtsSim radars (`stationary` + antenna WGS84) must use the antenna,
+/// not the global Emulator own-ship — otherwise dual-lab contacts at Barra do
+/// Riacho are measured from NL and filtered out by `max_range_m`.
+pub(crate) fn boat_for_geo_arpa(
+    stationary: bool,
+    antenna: Option<GeoPosition>,
+    global_boat: Option<GeoPosition>,
+) -> GeoPosition {
+    if stationary {
+        if let Some(pos) = antenna {
+            return pos;
+        }
+    }
+    global_boat.unwrap_or_else(|| GeoPosition::new(0.0, 0.0))
+}
+
 /// Publish monitor ARPA for `radar_id`. Without an enumerator → unavailable.
 pub fn publish_geo_arpa(radars: &SharedRadars, radar_id: &str) -> GeoArpaMeta {
     let geo = radars.geo_echo_config();
     let max_range_m = geo.effective_usable_radius_m();
-    let Some(_info) = radars.get_by_key(radar_id) else {
+    let Some(info) = radars.get_by_key(radar_id) else {
         return GeoArpaMeta::unavailable(radar_id, max_range_m);
     };
     let Some(enumerator) = radars.monitor_contact_enumerator(radar_id) else {
         return GeoArpaMeta::unavailable(radar_id, max_range_m);
     };
 
-    let boat = resolve_boat_position().unwrap_or_else(|| GeoPosition::new(0.0, 0.0));
+    let boat = boat_for_geo_arpa(
+        info.stationary,
+        info.antenna_position(),
+        resolve_boat_position(),
+    );
     let contacts = enumerator.list(boat, max_range_m);
 
     let start = geo.usable_bearing_start_deg;
@@ -263,5 +285,55 @@ mod tests {
         let json2 = serde_json::to_value(&without).unwrap();
         assert!(json2.get("lengthM").is_none());
         assert!(json2.get("beamM").is_none());
+    }
+
+    /// Dual-lab: Emulator own-ship is NL; ImevtsSim antenna + contact are BR.
+    /// Using NL as boat filters the contact; antenna pose keeps it in range.
+    #[test]
+    fn stationary_antenna_keeps_barra_contact_in_range() {
+        let antenna_br = GeoPosition::new(-19.8595, -40.0550);
+        let contact_br = GeoPosition::new(-19.8580, -40.0560); // ~130 m from antenna
+        let boat_nl = GeoPosition::new(53.0, 5.0);
+        let max_range_m = 25_000.0;
+
+        let (d_from_nl, _) = distance_and_bearing(&boat_nl, &contact_br);
+        assert!(
+            d_from_nl > max_range_m,
+            "NL→BR must exceed usable radius (got {d_from_nl} m)"
+        );
+
+        let boat = boat_for_geo_arpa(true, Some(antenna_br), Some(boat_nl));
+        assert!((boat.lat() - antenna_br.lat()).abs() < 1e-12);
+        assert!((boat.lon() - antenna_br.lon()).abs() < 1e-12);
+
+        let (d_from_antenna, _) = distance_and_bearing(&boat, &contact_br);
+        assert!(
+            d_from_antenna <= max_range_m,
+            "antenna→contact must pass range (got {d_from_antenna} m)"
+        );
+        assert!(
+            d_from_antenna < 500.0,
+            "expected ~130 m class distance, got {d_from_antenna} m"
+        );
+    }
+
+    #[test]
+    fn non_stationary_uses_global_boat_even_with_antenna() {
+        let antenna = GeoPosition::new(-19.8595, -40.0550);
+        let global = GeoPosition::new(53.0, 5.0);
+        let boat = boat_for_geo_arpa(false, Some(antenna), Some(global));
+        assert!((boat.lat() - 53.0).abs() < 1e-12);
+        assert!((boat.lon() - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stationary_without_antenna_falls_back_to_global_or_zero() {
+        let global = GeoPosition::new(53.0, 5.0);
+        let boat = boat_for_geo_arpa(true, None, Some(global));
+        assert!((boat.lat() - 53.0).abs() < 1e-12);
+
+        let zero = boat_for_geo_arpa(true, None, None);
+        assert_eq!(zero.lat(), 0.0);
+        assert_eq!(zero.lon(), 0.0);
     }
 }

@@ -46,21 +46,13 @@ pub(crate) fn new(
         .wire_units(Units::Meters)
         .build(&mut controls);
 
-    new_auto(ControlId::Gain, 0., 100., HAS_AUTO_NOT_ADJUSTABLE)
-        .wire_scale_factor(2.55, false)
-        .build(&mut controls);
-
-    new_auto(ControlId::Sea, 0., 100., HAS_AUTO_NOT_ADJUSTABLE)
-        .wire_scale_factor(2.55, false)
-        .build(&mut controls);
-
-    new_auto(ControlId::Rain, 0., 100., HAS_AUTO_NOT_ADJUSTABLE)
-        .wire_scale_factor(2.55, false)
-        .build(&mut controls);
+    // No Navico-style wire protocol: set_value / Command use GUI units directly.
+    // A wire_scale_factor would make Control::set divide (e.g. Gain 55→22, height 35→0).
+    new_auto(ControlId::Gain, 0., 100., HAS_AUTO_NOT_ADJUSTABLE).build(&mut controls);
+    new_auto(ControlId::Sea, 0., 100., HAS_AUTO_NOT_ADJUSTABLE).build(&mut controls);
+    new_auto(ControlId::Rain, 0., 100., HAS_AUTO_NOT_ADJUSTABLE).build(&mut controls);
 
     new_numeric(ControlId::AntennaHeight, 0., 60.)
-        .wire_scale_factor(1000., false)
-        .wire_scale_step(0.1)
         .wire_units(Units::Meters)
         .build(&mut controls);
 

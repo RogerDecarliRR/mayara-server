@@ -9,8 +9,9 @@ use tokio_graceful_shutdown::SubsystemHandle;
 use super::command::Command;
 use super::settings;
 use super::{DEFAULT_LISTEN_PORT, IMEVTS_SIM_RANGES, PIXEL_VALUES};
+use crate::config::GuardZone;
 use crate::radar::range::Ranges;
-use crate::radar::settings::ControlId;
+use crate::radar::settings::{ControlId, RANGE_UNITS_METRIC};
 use crate::radar::spoke::GenericSpoke;
 use crate::radar::{CommonRadar, Power, RadarError, RadarInfo, SharedRadars};
 use crate::{Brand, Cli};
@@ -193,6 +194,15 @@ impl ImevtsSimListener {
             return;
         };
         site.common.info.mark_input();
+        // Asset may relocate; keep CommonRadar + SharedRadars antenna in sync
+        // without touching global navdata (that would move the Emulator boat).
+        let antenna_moved = site.common.info.antenna_lat != Some(spoke.lat)
+            || site.common.info.antenna_lon != Some(spoke.lon);
+        site.common.info.antenna_lat = Some(spoke.lat);
+        site.common.info.antenna_lon = Some(spoke.lon);
+        if antenna_moved {
+            site.common.update();
+        }
         while let Ok(cu) = site.common.control_update_rx.try_recv() {
             let _ = site
                 .common
@@ -202,19 +212,18 @@ impl ImevtsSimListener {
         if self.publish_nav {
             crate::navdata::set_position(Some(spoke.lat), Some(spoke.lon), NAV_SOURCE);
         }
-        let _ = site.common.info.controls.set_value(
-            &ControlId::AntennaHeight,
-            (spoke.height_m as f64).into(),
-        );
-        let _ = site
-            .common
-            .info
-            .controls
-            .set_value(&ControlId::Range, (spoke.spoke_range_m as f64).into());
+        // AntennaHeight SoT = first-packet height_m in create_site; do not
+        // overwrite per spoke (GUI edits must stick). Never set Range per spoke
+        // (GUI ⟂). spoke.spoke_range_m still drives polar metres/bin via add_spoke.
 
         let data: GenericSpoke = spoke.samples_nibble;
+        // IMRS `angle` is already geographic north-up. Pass heading Some(0) so
+        // bearing = (0+angle)%spokes = angle. None would fall back to
+        // navdata::get_heading_true() (emulator boat heading) and rotate the
+        // MEPO polar by that heading.
         site.common
-            .add_spoke(spoke.spoke_range_m, spoke.angle, spoke.heading, data);
+            .add_spoke(spoke.spoke_range_m, spoke.angle, Some(0), data);
+        // Threshold SPOKE_BATCH (set in create_site) flushes only when ready.
         site.common.send_spoke_message();
     }
 
@@ -255,6 +264,18 @@ impl ImevtsSimListener {
             site_key
         );
 
+        // Shore-fixed antenna at the IMRS asset pose — not the Emulator boat.
+        // Keeps ARPA SOG/COG absolute when lab runs --emulator --imevts-sim.
+        info.stationary = true;
+        info.antenna_lat = Some(lat);
+        info.antenna_lon = Some(lon);
+
+        // IMEVTS_SIM_RANGES is metric-only; default RangeUnits=Nautical leaves
+        // update_valid_ranges() with an empty list → GUI +/- zoom no-ops.
+        let _ = info.controls.set_value(
+            &ControlId::RangeUnits,
+            (RANGE_UNITS_METRIC as f64).into(),
+        );
         let ranges = Ranges::new_by_distance(IMEVTS_SIM_RANGES);
         info.set_ranges(ranges);
         let _ = info
@@ -263,10 +284,33 @@ impl ImevtsSimListener {
         let _ = info
             .controls
             .set_value(&ControlId::AntennaHeight, (height_m as f64).into());
-        let _ = info.controls.set_value(
-            &ControlId::Range,
-            (*IMEVTS_SIM_RANGES.last().unwrap() as f64).into(),
+        // Mid step (4000 m); last()=72000 is too wide for useful PPI zoom.
+        let _ = info
+            .controls
+            .set_value(&ControlId::Range, 4000_f64.into());
+
+        // Align GZ1 to geo-echo usable sector × composition range so Auto-ARPA
+        // acquires even when persistence left a disabled zone (same as Emulator).
+        let gz1 = self.radars.geo_echo_config().arpa_acquisition_guard_zone();
+        info.controls
+            .set_guard_zone(&ControlId::GuardZone1, &gz1);
+        log::info!(
+            "ImevtsSim: Guard zone 1 from geo-echo ({:.0}–{:.0} deg, 0–{:.0} m)",
+            gz1.start_angle.to_degrees(),
+            gz1.end_angle.to_degrees(),
+            gz1.end_distance
         );
+        info.controls.set_guard_zone(
+            &ControlId::GuardZone2,
+            &GuardZone {
+                start_angle: 0.0,
+                end_angle: 0.0,
+                start_distance: 0.0,
+                end_distance: 0.0,
+                enabled: false,
+            },
+        );
+
         self.radars.update(&mut info);
 
         if self.publish_nav {

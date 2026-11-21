@@ -11,7 +11,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use super::blob::CompletedBlob;
 use super::tracker::{
-    CandidateSource, ProcessResult, TargetCandidate, TargetStatus, TargetTracker,
+    ActiveTarget, CandidateSource, ProcessResult, TargetCandidate, TargetStatus, TargetTracker,
 };
 use super::{
     ArpaTargetApi, PositionCovariance, TargetDangerApi, TargetMotionApi, TargetPositionApi,
@@ -601,24 +601,48 @@ impl TrackerManager {
         }
     }
 
-    /// Get all active targets as API objects
-    pub fn get_targets_api(&self, radar_position: Option<GeoPosition>) -> Vec<ArpaTargetApi> {
+    /// Active targets as API objects.
+    ///
+    /// When `radar_key` is `Some`, only targets whose `last_radar_key` matches
+    /// are returned — required for dual-radar labs (Emulator + ImevtsSim) so
+    /// `GET …/{id}/targets` does not mix NL boat tracks into a BR shore radar.
+    /// In `merge_mode` all radars share one tracker; the same `last_radar_key`
+    /// filter still applies when a key is given.
+    pub fn get_targets_api(
+        &self,
+        radar_key: Option<&str>,
+        radar_position: Option<GeoPosition>,
+    ) -> Vec<ArpaTargetApi> {
         let mut targets = Vec::new();
+
+        let push_shown = |targets: &mut Vec<ArpaTargetApi>, target: &ActiveTarget| {
+            if !target.is_shown() {
+                return;
+            }
+            if let Some(key) = radar_key {
+                if target.last_radar_key != key {
+                    return;
+                }
+            }
+            targets.push(active_target_to_api(target, radar_position.as_ref()));
+        };
 
         if self.merge_mode {
             if let Some(ref tracker) = self.shared_tracker {
                 for target in tracker.get_active_targets() {
-                    if target.is_shown() {
-                        targets.push(active_target_to_api(target, radar_position.as_ref()));
-                    }
+                    push_shown(&mut targets, target);
+                }
+            }
+        } else if let Some(key) = radar_key {
+            if let Some(tracker) = self.per_radar_trackers.get(key) {
+                for target in tracker.get_active_targets() {
+                    push_shown(&mut targets, target);
                 }
             }
         } else {
             for tracker in self.per_radar_trackers.values() {
                 for target in tracker.get_active_targets() {
-                    if target.is_shown() {
-                        targets.push(active_target_to_api(target, radar_position.as_ref()));
-                    }
+                    push_shown(&mut targets, target);
                 }
             }
         }
@@ -759,16 +783,8 @@ impl TrackerManager {
                             self.clear_all_targets(&radar_key);
                         }
                         TrackerCommand::GetTargets { radar_key, radar_position, response_tx } => {
-                            let targets = self.get_targets_api(radar_position);
-                            // Filter by radar_key if specified (only relevant in non-merged mode)
-                            let targets = if let Some(_key) = radar_key {
-                                // In merged mode, all targets are shared so we return all
-                                // In per-radar mode, get_targets_api already returns all,
-                                // but we could filter here if needed in the future
-                                targets
-                            } else {
-                                targets
-                            };
+                            let targets =
+                                self.get_targets_api(radar_key.as_deref(), radar_position);
                             let _ = response_tx.send(targets);
                         }
                     }
@@ -1318,7 +1334,9 @@ mod tests {
             time: 1000,
             size_meters: 30.0,
         });
-        assert_eq!(manager.get_targets_api(None).len(), 1);
+        assert_eq!(manager.get_targets_api(None, None).len(), 1);
+        assert_eq!(manager.get_targets_api(Some("nav1"), None).len(), 1);
+        assert!(manager.get_targets_api(Some("other"), None).is_empty());
     }
 
     /// A candidate that is lost before it was confirmed was never shown, so
@@ -1600,7 +1618,7 @@ mod tests {
     #[test]
     fn test_get_targets_api_empty() {
         let manager = make_test_manager(false);
-        let targets = manager.get_targets_api(None);
+        let targets = manager.get_targets_api(None, None);
         assert!(targets.is_empty());
     }
 
@@ -1608,8 +1626,39 @@ mod tests {
     fn test_get_targets_api_merged() {
         let manager = make_test_manager(true);
         let radar_pos = GeoPosition::new(52.0, 4.0);
-        let targets = manager.get_targets_api(Some(radar_pos));
+        let targets = manager.get_targets_api(None, Some(radar_pos));
         assert!(targets.is_empty()); // No blobs processed yet
+    }
+
+    /// Dual-radar lab: GET …/{id}/targets must not leak the other radar's tracks.
+    #[test]
+    fn get_targets_api_filters_by_radar_key() {
+        let mut manager = make_test_manager(false);
+        manager.process_marpa(MarpaRequest {
+            radar_key: "ims0002".to_string(),
+            position: GeoPosition::new(-19.85, -40.12),
+            radar_position: Some(GeoPosition::new(-19.85, -40.12)),
+            time: 1000,
+            size_meters: 30.0,
+        });
+        manager.process_marpa(MarpaRequest {
+            radar_key: "emulator".to_string(),
+            position: GeoPosition::new(52.0, 4.0),
+            radar_position: Some(GeoPosition::new(52.0, 4.01)),
+            time: 1000,
+            size_meters: 30.0,
+        });
+
+        assert_eq!(manager.get_targets_api(None, None).len(), 2);
+        assert_eq!(manager.get_targets_api(Some("ims0002"), None).len(), 1);
+        assert_eq!(manager.get_targets_api(Some("emulator"), None).len(), 1);
+        assert!(manager.get_targets_api(Some("missing"), None).is_empty());
+
+        let br = &manager.get_targets_api(Some("ims0002"), None)[0];
+        assert!(
+            br.position.latitude.unwrap() < 0.0,
+            "ims0002 must keep the BR pose, not the Emulator NL track"
+        );
     }
 
     /// Sink that drains the broadcast channel into a Vec so tests can

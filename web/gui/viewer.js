@@ -442,10 +442,20 @@ function subscribeToHeading() {
                 updateHeadingDisplayToggle();
               } else if (value.path === "navigation.courseOverGroundTrue") {
                 ownShipCog = value.value;
-                ppi?.setOwnShipMotion(ownShipCog, ownShipSog);
+                // Stationary shore radar: do not feed Emulator SOG/COG into PPI
+                // (would make AIS CPA relative to the moving lab boat).
+                if (isStationary) {
+                  ppi?.setOwnShipMotion(null, 0);
+                } else {
+                  ppi?.setOwnShipMotion(ownShipCog, ownShipSog);
+                }
               } else if (value.path === "navigation.speedOverGround") {
                 ownShipSog = value.value;
-                ppi?.setOwnShipMotion(ownShipCog, ownShipSog);
+                if (isStationary) {
+                  ppi?.setOwnShipMotion(null, 0);
+                } else {
+                  ppi?.setOwnShipMotion(ownShipCog, ownShipSog);
+                }
               } else if (
                 value.path === "navigation.position" &&
                 value.value?.latitude != null &&
@@ -955,7 +965,11 @@ function evictOwnShipFromAis() {
 // Update PPI with current heading
 function updateHeadingDisplay(mode) {
   if (ppi) {
-    ppi.setTrueHeading(trueHeading);
+    // Stationary shore radar: never feed Emulator headingTrue into the PPI
+    // (A2 already zeros motion; this keeps H Up / overlay north-fixed).
+    if (!isStationary) {
+      ppi.setTrueHeading(trueHeading);
+    }
     if (mode) {
       return ppi.setHeadingMode(mode);
     }
@@ -1177,8 +1191,16 @@ function createHeadingModeToggle() {
   toggleBtn.title = "Heading data required for North Up mode";
 
   toggleBtn.addEventListener("click", () => {
-    // Don't allow switching if disabled (no heading data)
+    // Don't allow switching if disabled (no heading data / stationary N Up)
     if (toggleBtn.classList.contains("myr_heading_disabled")) {
+      return;
+    }
+    // Shore radar: only N Up (PPI also rejects headingUp when stationary).
+    if (isStationary) {
+      headingMode = updateHeadingDisplay("northUp");
+      toggleBtn.innerHTML = "N Up";
+      toggleBtn.title = "Radar parado — só N Up";
+      ppi.redrawCanvas();
       return;
     }
 
@@ -1210,8 +1232,17 @@ function onHeadingReceived() {
 
   const toggleBtn = document.getElementById("myr_heading_toggle");
   if (toggleBtn) {
-    toggleBtn.classList.remove("myr_heading_disabled");
-    toggleBtn.title = "Click to toggle: Heading Up / North Up";
+    if (isStationary) {
+      // Stationary: keep N Up locked; Emulator heading must not unlock H Up.
+      headingMode = "northUp";
+      updateHeadingDisplay("northUp");
+      toggleBtn.classList.add("myr_heading_disabled");
+      toggleBtn.innerHTML = "N Up";
+      toggleBtn.title = "Radar parado — só N Up";
+    } else {
+      toggleBtn.classList.remove("myr_heading_disabled");
+      toggleBtn.title = "Click to toggle: Heading Up / North Up";
+    }
   }
   updateAisLozenge();
   updateRouteLozenge();
@@ -1259,10 +1290,18 @@ function onHeadingLost() {
   refreshPositionBoxHeading();
 
   const toggleBtn = document.getElementById("myr_heading_toggle");
-  if (toggleBtn && !stillHasHeading) {
-    toggleBtn.classList.add("myr_heading_disabled");
-    toggleBtn.innerHTML = "H Up";
-    toggleBtn.title = "Heading data required for North Up mode";
+  if (toggleBtn) {
+    if (isStationary) {
+      headingMode = "northUp";
+      updateHeadingDisplay("northUp");
+      toggleBtn.classList.add("myr_heading_disabled");
+      toggleBtn.innerHTML = "N Up";
+      toggleBtn.title = "Radar parado — só N Up";
+    } else if (!stillHasHeading) {
+      toggleBtn.classList.add("myr_heading_disabled");
+      toggleBtn.innerHTML = "H Up";
+      toggleBtn.title = "Heading data required for North Up mode";
+    }
   }
   updateAisLozenge();
   updateRouteLozenge();
@@ -2057,6 +2096,18 @@ function radarLoaded(r) {
 
   // Set stationary mode from capabilities
   isStationary = capabilities.stationary || false;
+  ppi?.setStationary(isStationary);
+  if (isStationary) {
+    ppi?.setOwnShipMotion(null, 0);
+    // Shore radar: force N Up; lock H Up toggle (Emulator heading ≠ antenna).
+    headingMode = updateHeadingDisplay("northUp") || "northUp";
+    const headingToggle = document.getElementById("myr_heading_toggle");
+    if (headingToggle) {
+      headingToggle.innerHTML = "N Up";
+      headingToggle.classList.add("myr_heading_disabled");
+      headingToggle.title = "Radar parado — só N Up";
+    }
+  }
 
   // Use provided spokeDataUrl or construct SignalK stream URL
   let spokeDataUrl = r.spokeDataUrl;
@@ -2146,9 +2197,11 @@ function radarLoaded(r) {
         // UI (H-Up toggle, AIS lozenge) the first time any heading appears.
         // Gated on the toggle still being disabled so it runs once on
         // transition, not every spoke; enable-only, so brief radar gaps don't
-        // flip the toggle back off.
+        // flip the toggle back off. Skip when stationary — toggle stays
+        // locked on N Up (disabled), so this gate would fire every batch.
         const headingToggle = document.getElementById("myr_heading_toggle");
         if (
+          !isStationary &&
           ppi.hasHeading() &&
           headingToggle?.classList.contains("myr_heading_disabled")
         ) {
@@ -2157,7 +2210,9 @@ function radarLoaded(r) {
         // The PPI auto-reverts to head-up when north-up loses every
         // heading source (it cannot place spokes geographically). Keep
         // the viewer's mode state and the toggle label in sync.
+        // Stationary never reverts to H Up (PPI rejects it).
         if (
+          !isStationary &&
           headingMode !== "headingUp" &&
           ppi.getHeadingMode() === "headingUp"
         ) {
