@@ -219,6 +219,10 @@ pub fn paint_spoke_rgba_masked(
 /// Samples are scaled from `spoke_range_m` onto a canvas whose half-side is
 /// `composition_range_m`. Full bearing circle, usable radius = composition
 /// (compat wrapper).
+///
+/// Without a world sampler, composition publish passes the real acquisition
+/// `spoke_range_m` (scale = gui/composition → interior disk when GUI is short).
+/// Emulator/world coverage uses [`rasterize_viewport_with_world`] instead.
 #[allow(dead_code)]
 pub fn rasterize_polar(
     polar: &[u8],
@@ -244,6 +248,11 @@ pub fn rasterize_polar(
 }
 
 /// Composition raster with usable-bearing and usable-radius masks.
+///
+/// `scale = spoke_range_m / composition_range_m`. Hardware / no-world publish
+/// passes the real acquisition spoke range (short GUI → interior disk). Do not
+/// lie with equal ranges to "fill" the canvas — that only stretches a short
+/// polar. World/emulator coverage paints via [`rasterize_viewport_with_world`].
 pub fn rasterize_polar_masked(
     polar: &[u8],
     spokes: usize,
@@ -687,6 +696,54 @@ mod tests {
             rgba[(far_y * size as usize + cx) * 4 + 3],
             0,
             "sample beyond usableRadiusM must stay empty"
+        );
+    }
+
+    /// No-world composition: honest scale = spoke_range / composition.
+    /// Short GUI Range paints an interior disk (rim clear). Lying with
+    /// spoke_range == composition only stretches bins — do not use that for
+    /// publish. Full coverage without stretching needs a world sampler
+    /// (see `viewport_world_sampler_ignores_acq_polar_and_spoke_range`).
+    #[test]
+    fn composition_polar_short_gui_paints_interior_only() {
+        let spokes = 1;
+        let spoke_len = 64;
+        let polar = vec![1u8; spokes * spoke_len];
+        let legend = solid_legend();
+        let size: u32 = 128;
+        let composition = 14.0 * 1852.0;
+        let gui_half_nm = 0.5 * 1852.0; // GUI Range ½ NM (acquisition label)
+        let usable = composition;
+
+        let honest = rasterize_polar_masked(
+            &polar, spokes, spoke_len, &legend, size, gui_half_nm, composition, 0.0, 360.0, usable,
+        );
+        // Historical hack: equal ranges stretch short polar to the rim.
+        let stretched = rasterize_polar_masked(
+            &polar, spokes, spoke_len, &legend, size, composition, composition, 0.0, 360.0, usable,
+        );
+
+        let cx = (size / 2) as usize;
+        let half = cx as f64;
+        let rim_r = (half * 0.9).round() as usize;
+        let rim_y = cx - rim_r;
+        let rim_i = (rim_y * size as usize + cx) * 4 + 3;
+        // Pixel inside the ½ NM disk (north).
+        let near_r = (half * (gui_half_nm / composition) * 0.5).round() as usize;
+        let near_y = cx - near_r;
+        let near_i = (near_y * size as usize + cx) * 4 + 3;
+
+        assert_eq!(
+            honest[rim_i], 0,
+            "honest short GUI spoke_range must leave the rim empty"
+        );
+        assert_eq!(
+            honest[near_i], 255,
+            "honest short GUI spoke_range must still paint the interior"
+        );
+        assert_eq!(
+            stretched[rim_i], 255,
+            "equal-range hack stretches bins to the rim (must not be publish path)"
         );
     }
 

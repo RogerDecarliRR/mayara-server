@@ -8,17 +8,21 @@ use super::png::encode_rgba;
 use super::annulus::{
     bbox_half_min_span_m, snap_range_step_up, view_m_per_bin, VIEWPORT_RANGE_STEPS_M,
 };
+use super::polar_blob;
 use super::raster::{
     rasterize_polar_masked, rasterize_viewport, rasterize_viewport_with_world,
     effective_viewport_max_size_px, view_range_from_bbox, viewport_image_corners, viewport_size_px,
     BBox,
 };
+use super::sampler::{fill_polar_from_world, ViewportWorldSampler};
 use super::state::{PolarBuffer, RevClock};
+use crate::config::EchoPaint;
 use crate::navdata;
 use crate::protos::RadarMessage::RadarMessage;
 use bytes::Bytes;
 use log::{debug, warn};
 use protobuf::Message;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use tokio::sync::broadcast;
@@ -49,12 +53,24 @@ impl PolarSnapshot {
             period_ms: 2_000,
         }
     }
+
+    /// True after at least one published revolution with spoke data.
+    pub fn is_ready(&self) -> bool {
+        self.revolution_id > 0
+            && self.spokes > 0
+            && self.spoke_len > 0
+            && !self.data.is_empty()
+    }
 }
+
+/// Capacity of the MEPO WebSocket broadcast (lagged clients skip intermediate revs).
+const MEPO_BROADCAST_CAP: usize = 4;
 
 struct RegistryEntry {
     frame: Arc<RwLock<EchoFrame>>,
     viewport: Arc<RwLock<EchoFrame>>,
     snapshot: Arc<RwLock<PolarSnapshot>>,
+    mepo_tx: broadcast::Sender<Bytes>,
 }
 
 static REGISTRY: LazyLock<Mutex<HashMap<String, RegistryEntry>>> =
@@ -77,6 +93,29 @@ pub fn ensure_entry(
     Arc<RwLock<EchoFrame>>,
     Arc<RwLock<PolarSnapshot>>,
 )> {
+    let (frame, viewport, snapshot, _) = ensure_entry_full(radars, radar_id)?;
+    Some((frame, viewport, snapshot))
+}
+
+/// Polar snapshot slot + MEPO broadcast subscribe for GET/WS handlers.
+pub fn mepo_subscribe(
+    radars: &SharedRadars,
+    radar_id: &str,
+) -> Option<(Arc<RwLock<PolarSnapshot>>, broadcast::Receiver<Bytes>)> {
+    let (_, _, snapshot, mepo_tx) = ensure_entry_full(radars, radar_id)?;
+    Some((snapshot, mepo_tx.subscribe()))
+}
+
+#[allow(clippy::type_complexity)]
+fn ensure_entry_full(
+    radars: &SharedRadars,
+    radar_id: &str,
+) -> Option<(
+    Arc<RwLock<EchoFrame>>,
+    Arc<RwLock<EchoFrame>>,
+    Arc<RwLock<PolarSnapshot>>,
+    broadcast::Sender<Bytes>,
+)> {
     {
         let reg = REGISTRY.lock().unwrap();
         if let Some(entry) = reg.get(radar_id) {
@@ -84,6 +123,7 @@ pub fn ensure_entry(
                 Arc::clone(&entry.frame),
                 Arc::clone(&entry.viewport),
                 Arc::clone(&entry.snapshot),
+                entry.mepo_tx.clone(),
             ));
         }
     }
@@ -93,6 +133,7 @@ pub fn ensure_entry(
     let frame = Arc::new(RwLock::new(EchoFrame::unavailable_sized(size_px)));
     let viewport = Arc::new(RwLock::new(EchoFrame::unavailable_sized(size_px)));
     let snapshot = Arc::new(RwLock::new(PolarSnapshot::empty(info.get_legend())));
+    let (mepo_tx, _) = broadcast::channel(MEPO_BROADCAST_CAP);
 
     {
         let mut reg = REGISTRY.lock().unwrap();
@@ -101,6 +142,7 @@ pub fn ensure_entry(
                 Arc::clone(&entry.frame),
                 Arc::clone(&entry.viewport),
                 Arc::clone(&entry.snapshot),
+                entry.mepo_tx.clone(),
             ));
         }
         reg.insert(
@@ -109,6 +151,7 @@ pub fn ensure_entry(
                 frame: Arc::clone(&frame),
                 viewport: Arc::clone(&viewport),
                 snapshot: Arc::clone(&snapshot),
+                mepo_tx: mepo_tx.clone(),
             },
         );
     }
@@ -116,12 +159,21 @@ pub fn ensure_entry(
     let key = radar_id.to_string();
     let frame_task = Arc::clone(&frame);
     let snapshot_task = Arc::clone(&snapshot);
+    let mepo_tx_task = mepo_tx.clone();
     let radars_task = radars.clone();
     tokio::spawn(async move {
-        run_compositor(key, info, radars_task, frame_task, snapshot_task).await;
+        run_compositor(
+            key,
+            info,
+            radars_task,
+            frame_task,
+            snapshot_task,
+            mepo_tx_task,
+        )
+        .await;
     });
 
-    Some((frame, viewport, snapshot))
+    Some((frame, viewport, snapshot, mepo_tx))
 }
 
 /// Render a viewport frame from the latest polar snapshot into the viewport
@@ -287,6 +339,7 @@ async fn run_compositor(
     radars: SharedRadars,
     frame: Arc<RwLock<EchoFrame>>,
     snapshot: Arc<RwLock<PolarSnapshot>>,
+    mepo_tx: broadcast::Sender<Bytes>,
 ) {
     info.wake_up();
     let mut rx: broadcast::Receiver<Bytes> = info.message_tx.subscribe();
@@ -313,7 +366,16 @@ async fn run_compositor(
                 }
             } => {
                 if clock.should_publish_now() {
-                    publish_frame(&key, &radars, &polar, &mut clock, &legend, &frame, &snapshot);
+                    publish_frame(
+                        &key,
+                        &radars,
+                        &polar,
+                        &mut clock,
+                        &legend,
+                        &frame,
+                        &snapshot,
+                        &mepo_tx,
+                    );
                 }
             }
             msg = rx.recv() => {
@@ -329,6 +391,7 @@ async fn run_compositor(
                                 &mut legend,
                                 &frame,
                                 &snapshot,
+                                &mepo_tx,
                             );
                         }
                     }
@@ -354,6 +417,7 @@ fn ingest_message(
     legend: &mut Legend,
     frame: &Arc<RwLock<EchoFrame>>,
     snapshot: &Arc<RwLock<PolarSnapshot>>,
+    mepo_tx: &broadcast::Sender<Bytes>,
 ) {
     for spoke in &message.spokes {
         let bearing_idx = spoke
@@ -375,7 +439,7 @@ fn ingest_message(
             clock.close_revolution();
             refresh_legend(key, radars, polar, legend, spoke.data.len());
             if clock.should_publish_now() {
-                publish_frame(key, radars, polar, clock, legend, frame, snapshot);
+                publish_frame(key, radars, polar, clock, legend, frame, snapshot, mepo_tx);
             }
         }
 
@@ -384,7 +448,7 @@ fn ingest_message(
         if clock.after_spoke_written(idx, spokes) {
             refresh_legend(key, radars, polar, legend, spoke.data.len());
             if clock.should_publish_now() {
-                publish_frame(key, radars, polar, clock, legend, frame, snapshot);
+                publish_frame(key, radars, polar, clock, legend, frame, snapshot, mepo_tx);
             }
         }
     }
@@ -423,8 +487,9 @@ fn resolve_nav_center() -> Option<(f64, f64)> {
     }
 }
 
-/// Physical range of the current spoke data (for raster scale only — never
-/// used as `echo.json` `rangeM`).
+/// Physical range of the current acquisition spoke data (GUI Control Range /
+/// spoke TAG). Used for Mayara heritage composition PNG — not for MEPO when a
+/// [`ViewportWorldSampler`] supplies world-filled usable coverage.
 fn resolve_spoke_range_m(radars: &SharedRadars, key: &str, polar: &PolarBuffer) -> f64 {
     if polar.last_range_m > 0.0 {
         return polar.last_range_m;
@@ -440,15 +505,40 @@ fn resolve_spoke_range_m(radars: &SharedRadars, key: &str, polar: &PolarBuffer) 
     0.0
 }
 
+/// MEPO polar for `store_snapshot` / renderer push.
+///
+/// With a world sampler (emulator): fill at `usable_radius_m` so spoke pitch is
+/// operational coverage, independent of GUI Control Range. Without sampler
+/// (hardware): borrow the acquisition buffer and its spoke range.
+fn resolve_mepo_polar<'a>(
+    sampler: Option<&ViewportWorldSampler>,
+    polar_data: &'a [u8],
+    spokes: usize,
+    spoke_len: usize,
+    acq_spoke_range_m: f64,
+    usable_radius_m: f64,
+) -> (Cow<'a, [u8]>, f64) {
+    if let Some(sampler) = sampler {
+        sampler.prepare();
+        let data = fill_polar_from_world(sampler, spokes, spoke_len, usable_radius_m);
+        (Cow::Owned(data), usable_radius_m)
+    } else {
+        (Cow::Borrowed(polar_data), acq_spoke_range_m)
+    }
+}
+
 fn store_snapshot(
     snapshot: &Arc<RwLock<PolarSnapshot>>,
+    mepo_tx: &broadcast::Sender<Bytes>,
+    echo_paint: EchoPaint,
     polar: &PolarBuffer,
+    data: &[u8],
     clock: &RevClock,
     legend: &Legend,
     spoke_range_m: f64,
 ) {
     let snap = PolarSnapshot {
-        data: polar.data.clone(),
+        data: data.to_vec(),
         spokes: polar.spokes,
         spoke_len: polar.spoke_len,
         center: polar.last_center.or_else(resolve_nav_center),
@@ -460,8 +550,12 @@ fn store_snapshot(
     if let Ok(mut slot) = snapshot.write() {
         *slot = snap.clone();
     }
-    // W1 D1: push MEPO to geo-echo-renderer when GEO_ECHO_RENDERER_URL is set.
-    super::renderer_client::push_polar_snapshot(&snap);
+    // Notify MEPO WS subscribers (binary blob). Lagged receivers skip revs.
+    if let Ok(bytes) = polar_blob::encode_snapshot(&snap) {
+        let _ = mepo_tx.send(Bytes::from(bytes));
+    }
+    // W1 D1: push MEPO to geo-echo-renderer only when echoPaint=sidecar + URL set.
+    super::renderer_client::push_polar_snapshot(&snap, echo_paint);
 }
 
 fn publish_frame(
@@ -472,15 +566,39 @@ fn publish_frame(
     legend: &Legend,
     frame: &Arc<RwLock<EchoFrame>>,
     snapshot: &Arc<RwLock<PolarSnapshot>>,
+    mepo_tx: &broadcast::Sender<Bytes>,
 ) {
     let geo = radars.geo_echo_config();
     let composition_range_m = geo.composition_range_m;
     let size_px = geo.echo_size_px;
     let refresh = refresh_interval_ms(clock.period_ms());
+    let usable_radius_m = geo.effective_usable_radius_m();
 
-    let spoke_range_m = resolve_spoke_range_m(radars, key, polar);
+    // Acquisition pitch (GUI Control Range) — composition PNG only.
+    let acq_spoke_range_m = resolve_spoke_range_m(radars, key, polar);
 
-    store_snapshot(snapshot, polar, clock, legend, spoke_range_m);
+    // H1 / GUI ⟂: when emulator registers a ViewportWorldSampler, MEPO is
+    // world-filled at usableRadiusM before store_snapshot → renderer push.
+    // Viewport paint stays forwarded to the sidecar (no fill_polar there).
+    let world = radars.viewport_world_sampler(key);
+    let (mepo_data, mepo_spoke_range_m) = resolve_mepo_polar(
+        world.as_ref(),
+        &polar.data,
+        polar.spokes,
+        polar.spoke_len,
+        acq_spoke_range_m,
+        usable_radius_m,
+    );
+    store_snapshot(
+        snapshot,
+        mepo_tx,
+        geo.echo_paint,
+        polar,
+        mepo_data.as_ref(),
+        clock,
+        legend,
+        mepo_spoke_range_m,
+    );
 
     let Some((lat, lon)) = resolve_center(polar) else {
         let mut cold = EchoFrame::unavailable_sized(size_px);
@@ -493,17 +611,20 @@ fn publish_frame(
         return;
     };
 
+    // Cheap local composition PNG from the acquisition polar (Mayara heritage).
+    // Viewport paint stays in the sidecar when GEO_ECHO_RENDERER_URL is set.
+    let corners = corners_for(lat, lon, composition_range_m);
     let rgba = rasterize_polar_masked(
         &polar.data,
         polar.spokes,
         polar.spoke_len,
         legend,
         size_px,
-        spoke_range_m,
+        acq_spoke_range_m,
         composition_range_m,
         geo.usable_bearing_start_deg,
         geo.usable_bearing_end_deg,
-        geo.effective_usable_radius_m(),
+        usable_radius_m,
     );
     let png_bytes = match encode_rgba(size_px, size_px, &rgba) {
         Ok(b) => b,
@@ -512,8 +633,6 @@ fn publish_frame(
             return;
         }
     };
-
-    let corners = corners_for(lat, lon, composition_range_m);
     let meta = EchoMeta {
         version: 1,
         available: true,
@@ -554,7 +673,8 @@ pub(crate) fn resolve_viewport_site(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_viewport_site;
+    use super::{resolve_mepo_polar, resolve_viewport_site, ViewportWorldSampler};
+    use std::sync::Arc;
 
     #[test]
     fn viewport_site_overrides_polar_center() {
@@ -568,5 +688,42 @@ mod tests {
             resolve_viewport_site(None, Some(polar_a), None),
             Some(polar_a)
         );
+    }
+
+    /// With a world sampler, MEPO spoke_range is usable coverage — not GUI acq.
+    #[test]
+    fn mepo_with_sampler_uses_usable_spoke_range() {
+        let acq: Vec<u8> = vec![1u8; 4 * 8];
+        let acq_range = 926.0; // ~½ NM GUI Control Range
+        let usable = 3704.0;
+        let sampler = ViewportWorldSampler::new(
+            Arc::new(|| {}),
+            Arc::new(|_b, range| if range > 1000.0 { 9 } else { 0 }),
+        );
+        let (data, spoke_range) =
+            resolve_mepo_polar(Some(&sampler), &acq, 4, 8, acq_range, usable);
+        assert!((spoke_range - usable).abs() < 1e-9);
+        assert_eq!(data.len(), 4 * 8);
+        // Outer bins past short GUI range must be world-filled, not acq bytes.
+        assert_ne!(&data[..], &acq[..]);
+        let mut outer = false;
+        for j in 0..8 {
+            let range = (j as f64 + 0.5) / 8.0 * usable;
+            if range > 1000.0 {
+                assert_eq!(data[j], 9);
+                outer = true;
+            }
+        }
+        assert!(outer);
+    }
+
+    #[test]
+    fn mepo_without_sampler_keeps_acquisition() {
+        let acq: Vec<u8> = vec![3u8; 16];
+        let acq_range = 694.0;
+        let (data, spoke_range) =
+            resolve_mepo_polar(None, &acq, 4, 4, acq_range, 3704.0);
+        assert!((spoke_range - acq_range).abs() < 1e-9);
+        assert_eq!(data.as_ref(), &acq[..]);
     }
 }

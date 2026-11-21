@@ -2,6 +2,7 @@
 
 use super::compositor::PolarSnapshot;
 use super::polar_blob;
+use crate::config::EchoPaint;
 use log::warn;
 use std::sync::OnceLock;
 
@@ -19,6 +20,13 @@ pub fn renderer_base_url() -> Option<&'static str> {
     .as_deref()
 }
 
+/// Whether MEPO should be PUTted to the sidecar renderer.
+///
+/// Requires `echoPaint=sidecar` **and** `GEO_ECHO_RENDERER_URL` set.
+pub fn should_push_to_renderer(echo_paint: EchoPaint) -> bool {
+    echo_paint == EchoPaint::Sidecar && renderer_base_url().is_some()
+}
+
 fn http_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
@@ -31,9 +39,13 @@ fn http_client() -> &'static reqwest::Client {
 
 /// Fire-and-forget MEPO PUT to `{GEO_ECHO_RENDERER_URL}/v1/polar`.
 ///
-/// No-op when the env var is unset. Does not block the compositor loop.
-/// Spawns on the current Tokio runtime (compositor task); skips if none.
-pub fn push_polar_snapshot(snapshot: &PolarSnapshot) {
+/// No-op when the env var is unset or `echo_paint` is not [`EchoPaint::Sidecar`].
+/// Does not block the compositor loop. Spawns on the current Tokio runtime;
+/// skips if none.
+pub fn push_polar_snapshot(snapshot: &PolarSnapshot, echo_paint: EchoPaint) {
+    if !should_push_to_renderer(echo_paint) {
+        return;
+    }
     let Some(base) = renderer_base_url() else {
         return;
     };
@@ -70,4 +82,21 @@ pub fn push_polar_snapshot(snapshot: &PolarSnapshot) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_push_when_gpu() {
+        // URL may or may not be set in the test process; Gpu must never push.
+        assert!(!should_push_to_renderer(EchoPaint::Gpu));
+    }
+
+    #[test]
+    fn sidecar_push_depends_on_url() {
+        let want = renderer_base_url().is_some();
+        assert_eq!(should_push_to_renderer(EchoPaint::Sidecar), want);
+    }
 }

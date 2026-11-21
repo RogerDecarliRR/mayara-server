@@ -163,6 +163,20 @@ pub enum GeoEchoMode {
     Viewport,
 }
 
+/// Where polar MEPO is painted for the monitor overlay.
+///
+/// `sidecar` (default): push MEPO to `GEO_ECHO_RENDERER_URL` for PNG paint.
+/// `gpu`: browser/GPU samples MEPO directly — skip renderer PUT.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum EchoPaint {
+    /// Paint via geo-echo-renderer (D1 PNG path).
+    #[default]
+    Sidecar,
+    /// Client samples MEPO on GPU; no renderer PUT.
+    Gpu,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct GeoEchoConfig {
     /// Active overlay workflow (`viewport` recommended).
@@ -197,6 +211,9 @@ pub struct GeoEchoConfig {
     /// Must be ≤ composition; [`Self::normalized`] clamps when larger.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usable_radius_m: Option<f64>,
+    /// Monitor paint path: `sidecar` (PUT renderer) or `gpu` (MEPO to client).
+    #[serde(default, rename = "echoPaint", alias = "echo_paint")]
+    pub echo_paint: EchoPaint,
 }
 
 impl Default for GeoEchoConfig {
@@ -211,6 +228,7 @@ impl Default for GeoEchoConfig {
             usable_bearing_start_deg: default_usable_bearing_start_deg(),
             usable_bearing_end_deg: default_usable_bearing_end_deg(),
             usable_radius_m: None,
+            echo_paint: EchoPaint::Sidecar,
         }
     }
 }
@@ -1146,6 +1164,26 @@ mod tests {
     }
 
     #[test]
+    fn geo_echo_echo_paint_defaults_to_sidecar() {
+        assert_eq!(GeoEchoConfig::default().echo_paint, EchoPaint::Sidecar);
+        let legacy: GeoEchoConfig = serde_json::from_str(
+            r#"{"mode":"viewport","composition_range_m":25928.0,"echo_size_px":2048,"target_meters_per_px":2.0,"max_size_px":2048,"usable_bearing_start_deg":0.0,"usable_bearing_end_deg":360.0}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.echo_paint, EchoPaint::Sidecar);
+        let gpu: GeoEchoConfig = serde_json::from_str(
+            r#"{"mode":"viewport","composition_range_m":25928.0,"echo_size_px":2048,"target_meters_per_px":2.0,"max_size_px":2048,"usable_bearing_start_deg":0.0,"usable_bearing_end_deg":360.0,"echoPaint":"gpu"}"#,
+        )
+        .unwrap();
+        assert_eq!(gpu.echo_paint, EchoPaint::Gpu);
+        let snake: GeoEchoConfig = serde_json::from_str(
+            r#"{"mode":"viewport","composition_range_m":25928.0,"echo_size_px":2048,"target_meters_per_px":2.0,"max_size_px":2048,"usable_bearing_start_deg":0.0,"usable_bearing_end_deg":360.0,"echo_paint":"sidecar"}"#,
+        )
+        .unwrap();
+        assert_eq!(snake.echo_paint, EchoPaint::Sidecar);
+    }
+
+    #[test]
     fn geo_echo_config_round_trip_serde() {
         let cfg = GeoEchoConfig {
             mode: GeoEchoMode::Composition,
@@ -1157,9 +1195,11 @@ mod tests {
             usable_bearing_start_deg: 10.0,
             usable_bearing_end_deg: 350.0,
             usable_radius_m: Some(4.0 * 1852.0),
+            echo_paint: EchoPaint::Gpu,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("usable_radius_m") || json.contains("usableRadiusM"));
+        assert!(json.contains("echoPaint"));
         let back: GeoEchoConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cfg);
         assert!(

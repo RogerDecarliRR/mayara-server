@@ -27,7 +27,7 @@ pub use annulus::{
     VIEWPORT_RANGE_STEPS_M,
 };
 pub use compositor::{
-    ensure_entry, ensure_running, publish_viewport, viewport_frame, PolarSnapshot,
+    ensure_entry, ensure_running, mepo_subscribe, publish_viewport, viewport_frame, PolarSnapshot,
 };
 pub use corners::{corners_for, refresh_interval_ms, EchoCorners, LonLat};
 pub use frame::{Center, EchoFrame, EchoMeta, SizePx};
@@ -39,5 +39,5 @@ pub use raster::{
     snap_size_hint_to_allowed, view_range_from_bbox, view_spoke_coverage_m, viewport_size_px, BBox,
 };
 pub use remote_paint::{paint_viewport, ViewportPaintRequest, ViewportPaintResult};
-pub use renderer_client::{push_polar_snapshot, renderer_base_url};
+pub use renderer_client::{push_polar_snapshot, renderer_base_url, should_push_to_renderer};
 pub use sampler::ViewportWorldSampler;

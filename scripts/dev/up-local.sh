@@ -117,6 +117,11 @@ if (( FORCE_BUILD )); then
     compose_fail_hint
     exit 1
   fi
+  # Imagem :local nova → ID velho dangling; layers reclaimable fora. Mantém
+  # cache mounts cargo (builder prune sem -a). Mesma ideia que imevts_docker_drop_superseded.
+  docker image prune -f >/dev/null 2>&1 || true
+  docker builder prune -f >/dev/null 2>&1 || true
+  echo "==> drop-superseded: dangling images + build cache órfão limpos (cache mount cargo mantido)"
 else
   ensure_local_image
   echo "==> docker compose up -d (sem rebuild; --build só para compilar o clone) …"

@@ -1,6 +1,7 @@
 # Lab local imevts: imagem mayara-server:local (--emulator) na 6502 + geo-echo-renderer na 6503.
 # Subir: ../scripts/dev/up-local.sh
 # FK-1 smoke: só --emulator (cenário embutido HALO). static-position porto só com land/marks ou RM-124.
+# Config/share em named volumes (sobrevivem recreate/rebuild); tmpfs só em /tmp.
 services:
   mayara-server:
     container_name: mayara-local
@@ -18,9 +19,10 @@ services:
       GEO_ECHO_RENDERER_URL: http://geo-echo-renderer:6503
     networks:
       - mayara-lab
+    volumes:
+      - mayara-config:/home/mayara/.config/mayara
+      - mayara-share:/home/mayara/.local/share/mayara
     tmpfs:
-      - /home/mayara/.config/mayara
-      - /home/mayara/.local/share/mayara
       - /tmp
     read_only: true
     security_opt:
@@ -56,3 +58,7 @@ services:
 networks:
   mayara-lab:
     driver: bridge
+
+volumes:
+  mayara-config:
+  mayara-share:

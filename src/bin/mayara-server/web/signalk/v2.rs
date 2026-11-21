@@ -29,7 +29,7 @@ use crate::web::{signalk::diagnostics, spokes_handler};
 use super::super::{Message, Web, WebSocket, WebSocketUpgrade};
 use mayara::{
     Brand, Expectation, InterfaceApi, NetworkCheck,
-    config::{Consent, GeoEchoConfig, GeoEchoMode, KnownRadar, SettingsStorage},
+    config::{Consent, EchoPaint, GeoEchoConfig, GeoEchoMode, KnownRadar, SettingsStorage},
     course::RouteFetchError,
     navdata,
     radar::{
@@ -69,6 +69,8 @@ const RADAR_ECHO_VIEWPORT_PNG_URI: &str =
     "/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport.png";
 const RADAR_GEO_ARPA_URI: &str =
     "/signalk/v2/api/vessels/self/radars/{radar_id}/geo-arpa.json";
+const RADAR_MEPO_URI: &str = "/signalk/v2/api/vessels/self/radars/{radar_id}/mepo";
+const RADAR_MEPO_WS_URI: &str = "/signalk/v2/api/vessels/self/radars/{radar_id}/mepo/ws";
 const GEO_ECHO_URI: &str = "/signalk/v2/api/geo-echo";
 
 /// How long a control PUT waits for the radar to object before it reports
@@ -115,6 +117,7 @@ const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
         post_echo_viewport,
         get_echo_viewport_png,
         get_geo_arpa,
+        get_mepo,
         get_geo_echo,
         set_geo_echo,
     ),
@@ -129,6 +132,7 @@ const CONTROL_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_mil
         TelemetryConsentRequest,
         GeoEchoApi,
         GeoEchoMode,
+        EchoPaint,
         ViewportRequest,
         ViewportResponse,
         Capabilities,
@@ -183,6 +187,8 @@ pub(crate) fn routes(axum: axum::Router<Web>) -> axum::Router<Web> {
         .route(RADAR_ECHO_VIEWPORT_URI, axum::routing::post(post_echo_viewport))
         .route(RADAR_ECHO_VIEWPORT_PNG_URI, get(get_echo_viewport_png))
         .route(RADAR_GEO_ARPA_URI, get(get_geo_arpa))
+        .route(RADAR_MEPO_URI, get(get_mepo))
+        .route(RADAR_MEPO_WS_URI, get(mepo_ws_handler))
         .route(ROUTE_URI, get(get_route))
         .route(OPENAPI_URI, get(openapi_json))
         .merge(SwaggerUi::new("/swagger-ui").config(SwaggerConfig::new([OPENAPI_URI])))
@@ -671,6 +677,10 @@ struct GeoEchoApi {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = 25928.0)]
     usable_radius_m: Option<f64>,
+    /// Monitor paint: `sidecar` (renderer PNG) or `gpu` (client samples MEPO).
+    #[serde(default)]
+    #[schema(example = "sidecar")]
+    echo_paint: EchoPaint,
 }
 
 impl From<&GeoEchoConfig> for GeoEchoApi {
@@ -686,6 +696,7 @@ impl From<&GeoEchoConfig> for GeoEchoApi {
             usable_bearing_end_deg: cfg.usable_bearing_end_deg,
             // Always expose the effective radius so clients see a concrete value.
             usable_radius_m: Some(cfg.effective_usable_radius_m()),
+            echo_paint: cfg.echo_paint,
         }
     }
 }
@@ -702,6 +713,7 @@ impl From<GeoEchoApi> for GeoEchoConfig {
             usable_bearing_start_deg: api.usable_bearing_start_deg,
             usable_bearing_end_deg: api.usable_bearing_end_deg,
             usable_radius_m: api.usable_radius_m,
+            echo_paint: api.echo_paint,
         }
     }
 }
@@ -709,6 +721,9 @@ impl From<GeoEchoApi> for GeoEchoConfig {
 /// Map bbox for a viewport echo render (lon/lat).
 /// Optional `radarLat`/`radarLon` place the antenna (asset site) when the
 /// polar buffer still carries another datum (e.g. emulator at Sneek).
+/// Coverage/scale overrides (usable*, maxSize*, targetMetersPerPx,
+/// maxViewportRangeM) = SoT from the imevts asset when present; otherwise
+/// Mayara geo-echo config defaults apply in the sidecar forward body.
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct ViewportRequest {
@@ -731,6 +746,24 @@ struct ViewportRequest {
         skip_serializing_if = "Option::is_none"
     )]
     size_hint_px: Option<u32>,
+    /// Operational bearing mask start (deg N=0 CW). Override from imevts asset SoT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usable_bearing_start_deg: Option<f64>,
+    /// Operational bearing mask end (deg N=0 CW). Override from imevts asset SoT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usable_bearing_end_deg: Option<f64>,
+    /// Operational usable radius (metres). Override from imevts asset SoT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    usable_radius_m: Option<f64>,
+    /// Max PNG edge (px) for viewport paint. Override from imevts asset SoT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_size_px: Option<u32>,
+    /// Target metres per pixel before size clamp. Override from imevts asset SoT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    target_meters_per_px: Option<f64>,
+    /// Ceiling for viewport range-step snap (metres). Override from imevts asset SoT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_viewport_range_m: Option<f64>,
 }
 
 /// Viewport render result — same shape as `echo.json` plus PNG path and scale.
@@ -769,8 +802,9 @@ async fn get_geo_echo(State(state): State<Web>) -> Response {
                    usableRadiusM (operational emission radius; omit → composition; \
                    clamped ≤ composition), optional maxViewportRangeM (viewport \
                    range-step snap ceiling; default = compositionRangeM), echoSizePx / \
-                   maxSizePx (1024 | 2048 | 4096), targetMetersPerPx, and usable \
-                   bearing sector (0…360°, North=0 clockwise; wraps when start>end).",
+                   maxSizePx (1024 | 2048 | 4096), targetMetersPerPx, usable \
+                   bearing sector (0…360°, North=0 clockwise; wraps when start>end), \
+                   and echoPaint (`sidecar` | `gpu`; default sidecar).",
     request_body(content = GeoEchoApi, example = json!({
         "mode": "viewport",
         "compositionRangeM": 25928.0,
@@ -779,7 +813,8 @@ async fn get_geo_echo(State(state): State<Web>) -> Response {
         "maxSizePx": 2048,
         "usableRadiusM": 25928.0,
         "usableBearingStartDeg": 0.0,
-        "usableBearingEndDeg": 360.0
+        "usableBearingEndDeg": 360.0,
+        "echoPaint": "sidecar"
     })),
     responses(
         (status = 200, body = GeoEchoApi, description = "Stored geo-echo settings"),
@@ -871,6 +906,158 @@ async fn get_geo_arpa(Path(radar_id): Path<String>, State(state): State<Web>) ->
 
 #[utoipa::path(
     get,
+    path = "/signalk/v2/api/vessels/self/radars/{radar_id}/mepo",
+    summary = "Latest MEPO v1 polar blob",
+    description = "Binary Mayara Echo POlar (MEPO) v1 snapshot for the radar \
+                   (`application/octet-stream`). Same bytes pushed to the geo-echo-renderer \
+                   when `echoPaint=sidecar`. For live updates use WebSocket \
+                   `…/mepo/ws` (sends latest on connect, then each new revolution_id).",
+    params(
+        ("radar_id" = String, Path, description = "Radar identifier", example = "emu0")
+    ),
+    responses(
+        (status = 200, description = "MEPO v1 octet-stream"),
+        (status = 404, description = "Radar not found"),
+        (status = 503, description = "No polar snapshot yet")
+    ),
+    tag = "Radars"
+)]
+async fn get_mepo(Path(radar_id): Path<String>, State(state): State<Web>) -> Response {
+    let Some((snapshot, _)) = geo_echo::mepo_subscribe(&state.radars, &radar_id) else {
+        return no_such_radar(&radar_id, &state.radars);
+    };
+    let snap = match snapshot.read() {
+        Ok(guard) => guard.clone(),
+        Err(_) => {
+            return SignalKResponse::failed(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "polar snapshot lock poisoned",
+            );
+        }
+    };
+    if !snap.is_ready() {
+        return SignalKResponse::failed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no polar snapshot yet",
+        );
+    }
+    match geo_echo::encode_snapshot(&snap) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/octet-stream",
+            )],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => SignalKResponse::failed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("MEPO encode failed: {e}"),
+        ),
+    }
+}
+
+/// WebSocket: binary MEPO v1 frames. Path is separate from GET `…/mepo`
+/// (`…/mepo/ws`) so Axum can route HTTP vs upgrade cleanly.
+async fn mepo_ws_handler(
+    Path(radar_id): Path<String>,
+    State(state): State<Web>,
+    ws: WebSocketUpgrade,
+) -> Response {
+    let Some((snapshot, mepo_rx)) = geo_echo::mepo_subscribe(&state.radars, &radar_id) else {
+        return no_such_radar(&radar_id, &state.radars);
+    };
+    let shutdown_rx = state.shutdown_tx.subscribe();
+    if let Some(radar) = state.radars.get_by_key(&radar_id) {
+        radar.wake_up();
+        state.radars.hold_up_antenna(&radar_id);
+        radar.wake_up();
+    }
+    let ws = if state.args.no_websocket_compression {
+        ws
+    } else {
+        ws.permessage_deflate()
+    };
+    ws.on_upgrade(move |socket| mepo_ws_stream(socket, snapshot, mepo_rx, shutdown_rx))
+}
+
+fn mepo_encode_ready(
+    snapshot: &std::sync::Arc<std::sync::RwLock<geo_echo::PolarSnapshot>>,
+) -> Option<(u64, bytes::Bytes)> {
+    let guard = snapshot.read().ok()?;
+    if !guard.is_ready() {
+        return None;
+    }
+    let rev = guard.revolution_id;
+    let bytes = geo_echo::encode_snapshot(&guard).ok()?;
+    Some((rev, bytes::Bytes::from(bytes)))
+}
+
+fn mepo_revolution_id(bytes: &[u8]) -> Option<u64> {
+    // MEPO v1: magic(4) + version(u16) + flags(u16) + revolution_id(u64)
+    if bytes.len() < 16 {
+        return None;
+    }
+    let mut rev_buf = [0u8; 8];
+    rev_buf.copy_from_slice(&bytes[8..16]);
+    Some(u64::from_le_bytes(rev_buf))
+}
+
+async fn mepo_ws_stream(
+    mut socket: WebSocket,
+    snapshot: std::sync::Arc<std::sync::RwLock<geo_echo::PolarSnapshot>>,
+    mut mepo_rx: tokio::sync::broadcast::Receiver<bytes::Bytes>,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+) {
+    // Send latest snapshot on connect (if ready). Drop the lock before await.
+    let mut last_rev = 0u64;
+    if let Some((rev, bytes)) = mepo_encode_ready(&snapshot) {
+        last_rev = rev;
+        if socket.send(Message::Binary(bytes)).await.is_err() {
+            return;
+        }
+    }
+
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                break;
+            }
+            r = mepo_rx.recv() => {
+                match r {
+                    Ok(bytes) => {
+                        if let Some(rev) = mepo_revolution_id(&bytes) {
+                            if rev == last_rev {
+                                continue;
+                            }
+                            last_rev = rev;
+                        }
+                        if let Err(e) = socket.send(Message::Binary(bytes)).await {
+                            log::debug!("MEPO WS send error: {e}");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        log::debug!("MEPO WS lagged by {n}; pulling latest snapshot");
+                        if let Some((rev, encoded)) = mepo_encode_ready(&snapshot) {
+                            if rev != last_rev {
+                                last_rev = rev;
+                                if socket.send(Message::Binary(encoded)).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
     path = "/signalk/v2/api/vessels/self/radars/{radar_id}/echo.png",
     summary = "Georeferenced echo PNG",
     description = "North-up RGBA radar echo (size from geo-echo config, default 2048×2048). \
@@ -949,9 +1136,10 @@ async fn post_echo_viewport(
         }
     };
 
-    // W1 D1: when GEO_ECHO_RENDERER_URL is set, forward paint (no local heavy
-    // fallback). Still start the lazy compositor so polar snapshots are pushed
-    // to the renderer (`store_snapshot` → `push_polar_snapshot`).
+    // D1: with GEO_ECHO_RENDERER_URL set, always forward paint to the sidecar.
+    // GUI ⟂ monitor is ensured by pushing a world-filled polar (MEPO) whose
+    // spoke_range = usableRadiusM — not by painting viewport in-process here.
+    // ensure_entry keeps the compositor pushing polars (`store_snapshot` → push).
     if let Some(base) = geo_echo::renderer_base_url() {
         let _ = geo_echo::ensure_entry(&state.radars, &radar_id);
         return forward_echo_viewport(base, &radar_id, &request, &state.radars).await;
@@ -1002,6 +1190,7 @@ async fn forward_echo_viewport(
     radars: &SharedRadars,
 ) -> Response {
     let geo = radars.geo_echo_config();
+    // Overrides = SoT imevts asset; defaults = geo-echo config Mayara.
     let png_path = format!("/signalk/v2/api/vessels/self/radars/{radar_id}/echo/viewport.png");
     let mut body = serde_json::json!({
         "west": request.west,
@@ -1011,12 +1200,22 @@ async fn forward_echo_viewport(
         "radarLat": request.radar_lat,
         "radarLon": request.radar_lon,
         "radarId": radar_id,
-        "usableBearingStartDeg": geo.usable_bearing_start_deg,
-        "usableBearingEndDeg": geo.usable_bearing_end_deg,
-        "usableRadiusM": geo.effective_usable_radius_m(),
-        "maxSizePx": geo.max_size_px,
-        "targetMetersPerPx": geo.target_meters_per_px,
-        "maxViewportRangeM": geo.max_viewport_range_m,
+        "usableBearingStartDeg": request
+            .usable_bearing_start_deg
+            .unwrap_or(geo.usable_bearing_start_deg),
+        "usableBearingEndDeg": request
+            .usable_bearing_end_deg
+            .unwrap_or(geo.usable_bearing_end_deg),
+        "usableRadiusM": request
+            .usable_radius_m
+            .unwrap_or_else(|| geo.effective_usable_radius_m()),
+        "maxSizePx": request.max_size_px.unwrap_or(geo.max_size_px),
+        "targetMetersPerPx": request
+            .target_meters_per_px
+            .unwrap_or(geo.target_meters_per_px),
+        "maxViewportRangeM": request
+            .max_viewport_range_m
+            .or(geo.max_viewport_range_m),
     });
     if let Some(hint) = request.size_hint_px {
         body["sizeHintPx"] = serde_json::json!(hint);
@@ -1078,7 +1277,8 @@ async fn get_echo_viewport_png(
         return no_such_radar(&radar_id, &state.radars);
     }
 
-    // W1 D1: proxy last PNG from renderer when GEO_ECHO_RENDERER_URL is set.
+    // D1: with GEO_ECHO_RENDERER_URL set, proxy the last PNG from the sidecar
+    // (paint never runs in-process on this path).
     if let Some(base) = geo_echo::renderer_base_url() {
         let url = format!("{base}/v1/viewport.png");
         match renderer_http_client().get(&url).send().await {
@@ -1114,7 +1314,7 @@ async fn get_echo_viewport_png(
         }
     }
 
-    // Ensure compositor (and empty viewport slot) exist.
+    // No renderer URL: serve the local viewport slot (in-process paint path).
     let _ = geo_echo::ensure_entry(&state.radars, &radar_id);
     let png = geo_echo::viewport_frame(&radar_id)
         .and_then(|slot| slot.read().ok().map(|f| f.png.clone()))
@@ -2934,6 +3134,31 @@ mod tests {
         )
         .expect("alias sizeHint float must deserialize");
         assert_eq!(alias.size_hint_px, Some(2048));
+    }
+
+    #[test]
+    fn viewport_request_coverage_overrides_deserialize() {
+        let req: ViewportRequest = serde_json::from_str(
+            r#"{
+                "west":-40.08,"south":-19.87,"east":-40.04,"north":-19.83,
+                "usableBearingStartDeg":10.0,"usableBearingEndDeg":350.0,
+                "usableRadiusM":5000.0,"maxSizePx":1024,
+                "targetMetersPerPx":1.5,"maxViewportRangeM":12000.0
+            }"#,
+        )
+        .expect("coverage overrides must deserialize");
+        assert_eq!(req.usable_bearing_start_deg, Some(10.0));
+        assert_eq!(req.usable_bearing_end_deg, Some(350.0));
+        assert_eq!(req.usable_radius_m, Some(5000.0));
+        assert_eq!(req.max_size_px, Some(1024));
+        assert_eq!(req.target_meters_per_px, Some(1.5));
+        assert_eq!(req.max_viewport_range_m, Some(12000.0));
+        let bare: ViewportRequest = serde_json::from_str(
+            r#"{"west":-40.08,"south":-19.87,"east":-40.04,"north":-19.83}"#,
+        )
+        .expect("bbox-only must deserialize");
+        assert!(bare.usable_radius_m.is_none());
+        assert!(bare.max_size_px.is_none());
     }
 
     /// A dual-range radar offers two entries, and clients that take the
