@@ -37,6 +37,11 @@ const STATIONARY_DELETE_REVOLUTION_COUNT: u64 = 10;
 /// a real low-speed track too early.
 const STATIONARY_SPEED_THRESHOLD: f64 = 0.5;
 
+/// SOG (m/s) at/above which PCA heading ±π ambiguity is resolved toward COG
+/// (0.5 kn). Below this, stabilize only vs previous heading — COG of a
+/// near-stationary blob is noisy and must not flip the hull on the map.
+const HEADING_COG_ALIGN_SOG_MS: f64 = 0.5 * 1852.0 / 3600.0;
+
 /// Maximum separation (meters) between two targets that are considered duplicates.
 /// A large vessel can produce multiple blobs per rotation from different hull sections,
 /// each within this distance of the others but all representing the same physical target.
@@ -389,11 +394,19 @@ impl ActiveTarget {
     }
 
     /// Assign PCA heading (RM-138): keep previous when candidate omits;
-    /// resolve ±π ambiguity toward the previous sense (no EMA / SOG freeze).
+    /// when SOG ≥ 0.5 kn, resolve ±π ambiguity toward COG; else toward the
+    /// previous heading sense. `update()` sets Kalman sog/cog before this.
     fn merge_heading(&mut self, candidate: &TargetCandidate) {
         let Some(raw) = candidate.heading_rad.filter(|h| h.is_finite()) else {
             return;
         };
+        let sog = self.sog.unwrap_or(0.0);
+        if sog >= HEADING_COG_ALIGN_SOG_MS {
+            if let Some(cog) = self.cog {
+                self.heading_rad = Some(stabilize_heading_rad(raw, Some(cog)));
+                return;
+            }
+        }
         self.heading_rad = Some(stabilize_heading_rad(raw, self.heading_rad));
     }
 
