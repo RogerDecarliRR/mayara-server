@@ -369,7 +369,8 @@ impl TrackerManager {
             CandidateSource::Anywhere
         };
 
-        let distance_m = blob_to_polar(&msg.blob, ctx).map(|(_, d)| d).unwrap_or(0.0);
+        let polar = blob_to_polar(&msg.blob, ctx);
+        let distance_m = polar.map(|(_, d)| d).unwrap_or(0.0);
         let dims = crate::radar::geo_arpa::estimate_dims_from_blob_extent(
             msg.blob.pixel_extent,
             msg.blob.spoke_extent,
@@ -382,6 +383,7 @@ impl TrackerManager {
             Some((l, b)) => (Some(l), Some(b)),
             None => (None, None),
         };
+        let heading_rad = heading_from_blob_pca(&msg.blob, ctx);
 
         // Create target candidate
         let candidate = TargetCandidate {
@@ -390,6 +392,7 @@ impl TrackerManager {
             size_meters: msg.blob.size_meters,
             length_m,
             beam_m,
+            heading_rad,
             radar_key: msg.radar_key.clone(),
             radar_position,
             max_target_speed_ms: ctx.max_target_speed_ms,
@@ -573,6 +576,7 @@ impl TrackerManager {
                     speed,
                     target.length_m,
                     target.beam_m,
+                    target.heading_rad,
                 ));
             }
         }
@@ -668,6 +672,7 @@ impl TrackerManager {
             size_meters: request.size_meters,
             length_m: None,
             beam_m: None,
+            heading_rad: None,
             radar_key: request.radar_key.clone(),
             radar_position: request.radar_position,
             max_target_speed_ms: SpokeContext::max_speed_from_mode(2), // Fast mode for MARPA
@@ -946,22 +951,45 @@ impl TrackerManager {
 /// every sweep and drew tracks of moored boats onto it (#848).
 const OWN_SHIP_ECHO_M: f64 = 30.0;
 
+/// Spoke offset from head-relative to true bearing (`ctx.bearing − ctx.angle`).
+/// `None` when the spoke carried no true bearing.
+fn heading_offset_spokes(ctx: &SpokeContext) -> Option<i32> {
+    let spoke_true_bearing = ctx.bearing?;
+    Some(spoke_true_bearing as i32 - ctx.angle as i32)
+}
+
+/// True bearing (radians, N=0 CW) of a head-relative spoke index.
+fn spoke_to_true_bearing_rad(spoke: u16, ctx: &SpokeContext) -> Option<f64> {
+    let offset = heading_offset_spokes(ctx)?;
+    let true_spoke =
+        (spoke as i32 + offset).rem_euclid(ctx.spokes_per_revolution as i32) as u16;
+    Some((true_spoke as f64 / ctx.spokes_per_revolution as f64) * TAU)
+}
+
+/// PCA heading from blob contour (fallback: all_pixels); RM-138.
+fn heading_from_blob_pca(blob: &CompletedBlob, ctx: &SpokeContext) -> Option<f64> {
+    let offset = heading_offset_spokes(ctx)?;
+    let pixels = if !blob.contour.is_empty() {
+        blob.contour.as_slice()
+    } else {
+        blob.all_pixels.as_slice()
+    };
+    if pixels.is_empty() {
+        return None;
+    }
+    crate::radar::geo_arpa::estimate_heading_rad_from_polar_pixels(
+        pixels,
+        offset,
+        ctx.spokes_per_revolution,
+        ctx.spoke_len,
+        ctx.range as f64,
+    )
+}
+
 /// True bearing (radians, 0 = north) and range (meters) of a blob's centre
 /// as seen from the radar. `None` when the spoke carried no heading.
 fn blob_to_polar(blob: &CompletedBlob, ctx: &SpokeContext) -> Option<(f64, f64)> {
-    // Get true bearing of the current spoke (requires heading info)
-    let spoke_true_bearing = ctx.bearing?;
-
-    // blob.center_spoke is head-relative (like ctx.angle)
-    // ctx.bearing is true bearing, ctx.angle is head-relative
-    // Heading offset = ctx.bearing - ctx.angle (in spokes)
-    // True bearing of blob = blob.center_spoke + heading_offset
-    let heading_offset = spoke_true_bearing as i32 - ctx.angle as i32;
-    let blob_true_bearing = (blob.center_spoke as i32 + heading_offset)
-        .rem_euclid(ctx.spokes_per_revolution as i32) as u16;
-
-    // Convert true bearing from spokes to radians
-    let bearing_rad = (blob_true_bearing as f64 / ctx.spokes_per_revolution as f64) * TAU;
+    let bearing_rad = spoke_to_true_bearing_rad(blob.center_spoke, ctx)?;
 
     // Calculate distance from pixel position
     let distance_m = if ctx.spoke_len > 0 {
@@ -1577,6 +1605,7 @@ mod tests {
             size_meters: 30.0,
             length_m: None,
             beam_m: None,
+            heading_rad: None,
             radar_key: "test".to_string(),
             radar_position: Some(radar_pos),
             max_target_speed_ms: max_speed,
@@ -1594,6 +1623,7 @@ mod tests {
                 size_meters: 30.0,
             length_m: None,
             beam_m: None,
+            heading_rad: None,
             radar_key: "test".to_string(),
                 radar_position: Some(radar_pos),
                 max_target_speed_ms: max_speed,
@@ -2482,6 +2512,7 @@ mod tests {
                 size_meters: 30.0,
             length_m: None,
             beam_m: None,
+            heading_rad: None,
             radar_key: "test".to_string(),
                 radar_position: Some(radar_pos),
                 max_target_speed_ms: max_speed,
@@ -2503,6 +2534,7 @@ mod tests {
             size_meters: 30.0,
             length_m: None,
             beam_m: None,
+            heading_rad: None,
             radar_key: "test".to_string(),
             radar_position: Some(radar_pos),
             max_target_speed_ms: max_speed,

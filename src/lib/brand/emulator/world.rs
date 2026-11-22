@@ -701,6 +701,7 @@ impl EmulatorWorld {
                 Some((l, b)) => (Some(l), Some(b)),
                 None => (None, None),
             };
+            // Circular echo → no major-axis heading (RM-138); do not invent.
             out.push(MonitorContact {
                 id,
                 position: pos,
@@ -710,6 +711,7 @@ impl EmulatorWorld {
                 speed_m_s,
                 length_m,
                 beam_m,
+                blob_heading_rad: None,
             });
         };
 

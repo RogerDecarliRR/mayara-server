@@ -16,7 +16,7 @@ pub struct MonitorContact {
     pub bearing_rad: f64,
     /// Distance from that boat, metres.
     pub distance_m: f64,
-    /// Heading in degrees (North = 0, clockwise).
+    /// Course over ground in degrees (North = 0, clockwise) — Kalman COG.
     pub heading_deg: f64,
     /// Speed over ground in m/s.
     pub speed_m_s: f64,
@@ -24,6 +24,9 @@ pub struct MonitorContact {
     pub length_m: Option<f64>,
     /// Estimated beam (m); omitted unless both dims pass validation.
     pub beam_m: Option<f64>,
+    /// Estimated bow heading from blob major axis (rad N=0 CW); RM-138.
+    /// Ambiguous ±π; independent of [`Self::heading_deg`] (COG).
+    pub blob_heading_rad: Option<f64>,
 }
 
 /// Callback that lists monitor contacts for a boat position and max range.
@@ -65,6 +68,10 @@ pub struct GeoArpaTarget {
     /// Estimated beam metres; only with valid `length_m` (RM-102).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub beam_m: Option<f64>,
+    /// Estimated heading from PCA of blob polar imprint (rad N=0 CW); RM-138.
+    /// Omitted when cloud is circular/degenerate. Separate from `cog`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heading: Option<f64>,
 }
 
 /// Contract for `GET …/geo-arpa.json` (camelCase).
@@ -172,6 +179,7 @@ pub fn publish_geo_arpa(radars: &SharedRadars, radar_id: &str) -> GeoArpaMeta {
             sog: c.speed_m_s,
             length_m,
             beam_m,
+            heading: c.blob_heading_rad,
         });
     }
 
@@ -242,6 +250,7 @@ mod tests {
                         speed_m_s: 2.0,
                         length_m: None,
                         beam_m: None,
+                        blob_heading_rad: None,
                     })
                 })
                 .collect()
@@ -272,19 +281,25 @@ mod tests {
             sog: 0.0,
             length_m: Some(80.0),
             beam_m: Some(12.0),
+            heading: Some(1.2),
         };
         let json = serde_json::to_value(&with_dims).unwrap();
         assert_eq!(json["lengthM"], 80.0);
         assert_eq!(json["beamM"], 12.0);
+        assert_eq!(json["heading"], 1.2);
+        assert_eq!(json["cog"], 0.0);
 
         let without = GeoArpaTarget {
             length_m: None,
             beam_m: None,
+            heading: None,
             ..with_dims
         };
         let json2 = serde_json::to_value(&without).unwrap();
         assert!(json2.get("lengthM").is_none());
         assert!(json2.get("beamM").is_none());
+        assert!(json2.get("heading").is_none());
+        assert!(json2.get("cog").is_some());
     }
 
     /// Dual-lab: Emulator own-ship is NL; ImevtsSim antenna + contact are BR.

@@ -58,13 +58,14 @@ pub fn enumerator_from_snapshot(
                     speed_m_s: c.speed_m_s,
                     length_m: c.length_m,
                     beam_m: c.beam_m,
+                    blob_heading_rad: c.blob_heading_rad,
                 })
             })
             .collect()
     }))
 }
 
-/// Build a [`MonitorContact`] from tracker state (geo + optional estimated dims).
+/// Build a [`MonitorContact`] from tracker state (geo + optional estimated dims/heading).
 pub fn contact_from_track(
     id: u64,
     position: GeoPosition,
@@ -73,6 +74,7 @@ pub fn contact_from_track(
     speed_m_s: f64,
     length_m: Option<f64>,
     beam_m: Option<f64>,
+    blob_heading_rad: Option<f64>,
 ) -> MonitorContact {
     let (distance_m, bearing_rad) = match boat {
         Some(b) => distance_and_bearing(b, &position),
@@ -87,5 +89,6 @@ pub fn contact_from_track(
         speed_m_s,
         length_m,
         beam_m,
+        blob_heading_rad,
     }
 }

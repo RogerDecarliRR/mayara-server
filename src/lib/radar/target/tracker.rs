@@ -9,6 +9,7 @@ use std::f64::consts::{FRAC_PI_2, TAU};
 use super::manager::GUARD_ZONE_COUNT;
 use super::motion::{ImmMotionModel, MotionModel};
 use super::{METERS_PER_DEGREE_LATITUDE, PositionCovariance, meters_per_degree_longitude};
+use crate::radar::geo_arpa::stabilize_heading_rad;
 use crate::radar::GeoPosition;
 
 /// Number of revolutions without update before a target is marked as lost
@@ -180,6 +181,8 @@ pub struct TargetCandidate {
     pub length_m: Option<f64>,
     /// Estimated beam from blob extent; only with valid `length_m`.
     pub beam_m: Option<f64>,
+    /// Estimated bow heading from blob PCA imprint (rad N=0 CW); RM-138.
+    pub heading_rad: Option<f64>,
     /// Source radar key
     pub radar_key: String,
     /// Radar position (for bearing/distance calculation)
@@ -206,6 +209,8 @@ pub struct ActiveTarget {
     pub length_m: Option<f64>,
     /// Estimated beam metres from latest blob extent.
     pub beam_m: Option<f64>,
+    /// Estimated bow heading from blob PCA imprint (rad N=0 CW); RM-138.
+    pub heading_rad: Option<f64>,
     /// Speed over ground (m/s), None until first update
     pub sog: Option<f64>,
     /// Course over ground (radians, 0 = North), None until first update
@@ -276,6 +281,7 @@ impl ActiveTarget {
             size_meters: candidate.size_meters,
             length_m: candidate.length_m,
             beam_m: candidate.beam_m,
+            heading_rad: candidate.heading_rad,
             sog: None, // No speed until first update
             cog: None, // No course until first update
             motion_model,
@@ -366,6 +372,7 @@ impl ActiveTarget {
             self.length_m = candidate.length_m;
             self.beam_m = candidate.beam_m;
         }
+        self.merge_heading(candidate);
         self.last_update = candidate.time;
         self.update_count += 1;
         self.last_radar_key = candidate.radar_key.clone();
@@ -379,6 +386,15 @@ impl ActiveTarget {
         }
 
         true
+    }
+
+    /// Assign PCA heading (RM-138): keep previous when candidate omits;
+    /// resolve ±π ambiguity toward the previous sense (no EMA / SOG freeze).
+    fn merge_heading(&mut self, candidate: &TargetCandidate) {
+        let Some(raw) = candidate.heading_rad.filter(|h| h.is_finite()) else {
+            return;
+        };
+        self.heading_rad = Some(stabilize_heading_rad(raw, self.heading_rad));
     }
 
     /// Predict position at given time using motion model
@@ -1016,6 +1032,7 @@ mod tests {
             size_meters: 30.0,
             length_m: None,
             beam_m: None,
+            heading_rad: None,
             radar_key: "test".to_string(),
             radar_position: Some(GeoPosition::new(52.0, 4.0)),
             max_target_speed_ms: TEST_MAX_SPEED_MS,
@@ -2041,6 +2058,7 @@ mod tests {
             size_meters: 30.0,
             length_m: None,
             beam_m: None,
+            heading_rad: None,
             radar_key: "test".to_string(),
             radar_position: Some(GeoPosition::new(52.0, 4.0)),
             max_target_speed_ms: max_speed_ms,
@@ -2267,6 +2285,7 @@ mod tests {
                 size_meters: 30.0,
             length_m: None,
             beam_m: None,
+            heading_rad: None,
             radar_key: "test".to_string(),
                 radar_position: radar,
                 max_target_speed_ms: max_speed_ms,
@@ -2285,6 +2304,7 @@ mod tests {
                 size_meters: 30.0,
             length_m: None,
             beam_m: None,
+            heading_rad: None,
             radar_key: "test".to_string(),
                 radar_position: radar,
                 max_target_speed_ms: max_speed_ms,
@@ -2345,6 +2365,7 @@ mod tests {
                 size_meters: 30.0,
             length_m: None,
             beam_m: None,
+            heading_rad: None,
             radar_key: "test".to_string(),
                 radar_position: Some(GeoPosition::new(52.0, 4.0)),
                 max_target_speed_ms: max_speed_ms,
@@ -2371,6 +2392,7 @@ mod tests {
             size_meters: 30.0,
             length_m: None,
             beam_m: None,
+            heading_rad: None,
             radar_key: "test".to_string(),
             radar_position: Some(GeoPosition::new(52.0, 4.0)),
             max_target_speed_ms: max_speed_ms,
