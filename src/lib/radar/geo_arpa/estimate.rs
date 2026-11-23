@@ -1,8 +1,9 @@
 //! Estimate LOA/beam and heading from polar echo extent (RM-132 / RM-138).
 //!
-//! Radar returns are blobs with radial and cross-range span. When both spans
-//! are usable and pass RM-102 validation, expose them as `lengthM`/`beamM`.
-//! Equal or invalid spans → omit (never invent aspect ratio or pass sim truth).
+//! Radar returns are blobs with radial and cross-range span. LOA = max of the
+//! two spans; beam = LOA/6 (fixed aspect — not measured from the minor span).
+//! Emit `lengthM`/`beamM` only when the pair passes RM-102 validation; never
+//! pass sim truth.
 //!
 //! Heading (RM-138): PCA major axis of the polar imprint in ENU (east/north)
 //! relative to the antenna. Ambiguous by ±π (bow vs stern); tracker picks the
@@ -36,7 +37,7 @@ pub fn valid_dimensions(length_m: f64, beam_m: f64) -> bool {
     beam_m > 0.0 && beam_m < length_m
 }
 
-/// LOA = max(span), beam = min(span). `None` when equal or outside RM-102.
+/// LOA = max(span), beam = LOA/6. `None` when outside RM-102.
 pub fn estimate_dims_from_spans(range_span_m: f64, cross_span_m: f64) -> Option<(f64, f64)> {
     if !range_span_m.is_finite() || !cross_span_m.is_finite() {
         return None;
@@ -45,7 +46,7 @@ pub fn estimate_dims_from_spans(range_span_m: f64, cross_span_m: f64) -> Option<
         return None;
     }
     let length = range_span_m.max(cross_span_m);
-    let beam = range_span_m.min(cross_span_m);
+    let beam = length / 6.0;
     if valid_dimensions(length, beam) {
         Some((length, beam))
     } else {
@@ -295,24 +296,28 @@ mod tests {
     fn estimate_from_distinct_spans() {
         let (loa, beam) = estimate_dims_from_spans(80.0, 16.0).expect("ok");
         assert!((loa - 80.0).abs() < 1e-9);
-        assert!((beam - 16.0).abs() < 1e-9);
+        assert!((beam - 80.0 / 6.0).abs() < 1e-9);
         let (loa2, beam2) = estimate_dims_from_spans(16.0, 80.0).expect("swap");
         assert!((loa2 - 80.0).abs() < 1e-9);
-        assert!((beam2 - 16.0).abs() < 1e-9);
+        assert!((beam2 - 80.0 / 6.0).abs() < 1e-9);
     }
 
     #[test]
-    fn equal_spans_omitted() {
-        assert!(estimate_dims_from_spans(30.0, 30.0).is_none());
+    fn equal_spans_emit_l_over_6() {
+        let (loa, beam) = estimate_dims_from_spans(30.0, 30.0).expect("equal spans ok");
+        assert!((loa - 30.0).abs() < 1e-9);
+        assert!((beam - 5.0).abs() < 1e-9);
+        assert!(valid_dimensions(loa, beam));
     }
 
     #[test]
     fn polar_estimate_uses_cross_range() {
         let range_span = 40.0;
         let bearing = 0.1; // rad
-        let distance = 200.0;
+        let distance = 200.0; // cross = 20 m → LOA = max(40, 20)
         let (loa, beam) = estimate_dims_from_polar(range_span, bearing, distance).expect("ok");
-        assert!((loa - 40.0).abs() < 1e-6 || (beam - 40.0).abs() < 1e-6);
+        assert!((loa - 40.0).abs() < 1e-6);
+        assert!((beam - 40.0 / 6.0).abs() < 1e-6);
         assert!(valid_dimensions(loa, beam));
     }
 

@@ -4,7 +4,8 @@
 //! bearings; composition is canvas only). Lab source: emulator world contacts via
 //! [`MonitorContactEnumerator`], or ARPA tracker snapshot (ImevtsSim / hardware).
 //! Hardware without an enumerator returns `available: false` and an empty target list.
-//! Optional `lengthM`/`beamM` are estimated from echo extent (RM-132), never sim truth.
+//! Optional `lengthM`/`beamM` from echo extent (RM-132): LOA = max span, beam =
+//! LOA/6; gated by RM-102. Never sim truth.
 //! Optional `heading` (rad) from PCA of the polar imprint (RM-138), separate from `cog`.
 
 mod estimate;
