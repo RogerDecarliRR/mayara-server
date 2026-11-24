@@ -9,6 +9,7 @@ use crate::radar::SharedRadars;
 use crate::Cli;
 
 mod command;
+mod gain;
 mod receiver;
 mod settings;
 

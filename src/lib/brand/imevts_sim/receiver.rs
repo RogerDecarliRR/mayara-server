@@ -7,6 +7,7 @@ use tokio::net::UdpSocket;
 use tokio_graceful_shutdown::SubsystemHandle;
 
 use super::command::Command;
+use super::gain::ReceiverLevels;
 use super::settings;
 use super::{DEFAULT_LISTEN_PORT, IMEVTS_SIM_RANGES, PIXEL_VALUES};
 use crate::config::GuardZone;
@@ -110,6 +111,8 @@ pub(crate) fn parse_imrs(packet: &[u8]) -> Option<ImrsSpoke> {
 struct SiteRadar {
     common: CommonRadar,
     command: Option<Command>,
+    /// Gain / Sea / Rain snapshot; refreshed only when a control update arrives.
+    levels: ReceiverLevels,
 }
 
 pub(crate) struct ImevtsSimListener {
@@ -203,11 +206,16 @@ impl ImevtsSimListener {
         if antenna_moved {
             site.common.update();
         }
+        let mut controls_changed = false;
         while let Ok(cu) = site.common.control_update_rx.try_recv() {
             let _ = site
                 .common
                 .process_control_update(cu, &mut site.command)
                 .await;
+            controls_changed = true;
+        }
+        if controls_changed {
+            site.levels = ReceiverLevels::from_controls(&site.common.info.controls);
         }
         if self.publish_nav {
             crate::navdata::set_position(Some(spoke.lat), Some(spoke.lon), NAV_SOURCE);
@@ -216,7 +224,11 @@ impl ImevtsSimListener {
         // overwrite per spoke (GUI edits must stick). Never set Range per spoke
         // (GUI ⟂). spoke.spoke_range_m still drives polar metres/bin via add_spoke.
 
-        let data: GenericSpoke = spoke.samples_nibble;
+        let mut data: GenericSpoke = spoke.samples_nibble;
+        // Before add_spoke so GUI, MEPO and the ARPA blob detector see the same echo.
+        if !site.levels.is_neutral() {
+            site.levels.apply(&mut data, spoke.spoke_range_m);
+        }
         // IMRS `angle` is already geographic north-up. Pass heading Some(0) so
         // bearing = (0+angle)%spokes = angle. None would fall back to
         // navdata::get_heading_true() (emulator boat heading) and rotate the
@@ -333,7 +345,12 @@ impl ImevtsSimListener {
         common.set_spoke_batch_threshold(SPOKE_BATCH);
         // geo-arpa: expose ARPA tracker tracks (dims estimated from blob extent).
         self.radars.ensure_tracker_monitor_enumerator(&key);
-        Some(SiteRadar { common, command })
+        let levels = ReceiverLevels::from_controls(&common.info.controls);
+        Some(SiteRadar {
+            common,
+            command,
+            levels,
+        })
     }
 }
 
