@@ -6,6 +6,11 @@
 # Config/share em named volumes (sobrevivem recreate/rebuild); tmpfs só em /tmp.
 services:
   mayara-server:
+    # Valores FL/IMRS vêm do .env da raiz imevts (MAYARA_EMULATOR, IMEVTS_SIM_SPOKES, …).
+    # Sem isto, `docker compose` só do fork usa defaults (emulador ligado, 2048).
+    env_file:
+      - path: ../../.env
+        required: false
     container_name: mayara-local
     build:
       context: ..
@@ -28,6 +33,9 @@ services:
       # Mesmo valor no sim e no receiver IMRS (2048|8192; default 2048).
       IMEVTS_SIM_SPOKES: ${IMEVTS_SIM_SPOKES:-2048}
       MAYARA_IMRS_SPOKES: ${MAYARA_IMRS_SPOKES:-}
+      IMEVTS_SIM_SPOKE_SPARSE: ${IMEVTS_SIM_SPOKE_SPARSE:-auto}
+      IMEVTS_SIM_SPOKE_DENSE: ${IMEVTS_SIM_SPOKE_DENSE:-}
+      IMEVTS_SIM_SPOKE_STRIDE: ${IMEVTS_SIM_SPOKE_STRIDE:-}
       # FL / RM-142: 0 = MEPO sempre v1 denso (~8 MiB a 8192); default compacta v2.
       MAYARA_MEPO_COMPACT: ${MAYARA_MEPO_COMPACT:-1}
     networks:

@@ -36,6 +36,8 @@ pub struct PolarSnapshot {
     pub spoke_len: usize,
     /// Spokes counted in a revolution (sparse radar); PPI reduce display axis.
     pub observed_spokes_per_rev: usize,
+    /// Sparse revolution row indices (including all-zero spokes), for PPI reduce.
+    pub received_indices: Vec<u16>,
     pub center: Option<(f64, f64)>,
     pub spoke_range_m: f64,
     pub legend: Legend,
@@ -50,6 +52,7 @@ impl PolarSnapshot {
             spokes: 0,
             spoke_len: 0,
             observed_spokes_per_rev: 0,
+            received_indices: Vec::new(),
             center: None,
             spoke_range_m: 0.0,
             legend,
@@ -286,8 +289,14 @@ pub fn publish_viewport(
             PolarDisplayMode::Default => (snap.data.clone(), spokes_n),
             PolarDisplayMode::Reduce => {
                 let observed = (snap.observed_spokes_per_rev > 0).then_some(snap.observed_spokes_per_rev);
-                let (reduced, display_spokes) =
-                    reduce_for_display(&snap.data, spokes_n, spoke_len_n, observed);
+                let received = (!snap.received_indices.is_empty()).then_some(snap.received_indices.as_slice());
+                let (reduced, display_spokes) = reduce_for_display(
+                    &snap.data,
+                    spokes_n,
+                    spoke_len_n,
+                    observed,
+                    received,
+                );
                 (reduced, display_spokes)
             }
         };
@@ -573,6 +582,7 @@ fn store_snapshot(
         spokes: polar.spokes,
         spoke_len: polar.spoke_len,
         observed_spokes_per_rev: clock.observed_spokes_per_rev,
+        received_indices: polar.received_row_indices(),
         center: polar.last_center.or_else(resolve_nav_center),
         spoke_range_m,
         legend: legend.clone(),

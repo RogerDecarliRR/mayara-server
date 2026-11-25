@@ -7,6 +7,8 @@ pub(super) struct PolarBuffer {
     pub spokes: usize,
     pub spoke_len: usize,
     pub data: Vec<u8>,
+    /// Rows written during the current revolution (sparse radar: include all-zero UDP spokes).
+    pub received: Vec<bool>,
     pub last_center: Option<(f64, f64)>,
     pub last_range_m: f64,
 }
@@ -19,6 +21,7 @@ impl PolarBuffer {
             spokes,
             spoke_len,
             data: vec![0u8; spokes * spoke_len],
+            received: vec![false; spokes],
             last_center: None,
             last_range_m: 0.0,
         }
@@ -31,7 +34,25 @@ impl PolarBuffer {
             self.spokes = spokes;
             self.spoke_len = spoke_len;
             self.data = vec![0u8; spokes * spoke_len];
+            self.received = vec![false; spokes];
         }
+    }
+
+    pub fn clear_received(&mut self) {
+        self.received.fill(false);
+    }
+
+    /// Angle indices written this revolution (for PPI reduce / MEPO v2).
+    pub fn received_row_indices(&self) -> Vec<u16> {
+        let mut out = Vec::new();
+        for (row, &seen) in self.received.iter().enumerate() {
+            if seen {
+                if let Ok(idx) = u16::try_from(row) {
+                    out.push(idx);
+                }
+            }
+        }
+        out
     }
 
     pub fn write_spoke(&mut self, index: usize, samples: &[u8]) {
@@ -40,6 +61,9 @@ impl PolarBuffer {
         }
         if index >= self.spokes {
             return;
+        }
+        if index < self.received.len() {
+            self.received[index] = true;
         }
         let len = samples.len().min(self.spoke_len);
         let start = index * self.spoke_len;

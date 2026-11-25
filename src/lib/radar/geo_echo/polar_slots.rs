@@ -94,6 +94,7 @@ mod tests {
             spokes: 1,
             spoke_len: 1,
             observed_spokes_per_rev: 0,
+            received_indices: Vec::new(),
             spoke_range_m: 100.0,
             center: None,
             legend: stub_legend(),

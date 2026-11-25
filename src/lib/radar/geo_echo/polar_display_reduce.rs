@@ -33,11 +33,13 @@ impl PolarDisplayMode {
 ///
 /// `observed_spokes_per_rev`: spokes counted in a full revolution (RevClock / GUI calibrate);
 /// when set, used as `actual` instead of counting non-zero rows (sea clutter skewed bearing).
+/// `received_indices`: rows sent this revolution (sparse radar), including all-zero spokes.
 pub fn reduce_for_display(
     data: &[u8],
     reported_spokes: usize,
     spoke_len: usize,
     observed_spokes_per_rev: Option<usize>,
+    received_indices: Option<&[u16]>,
 ) -> (Vec<u8>, usize) {
     let reported = reported_spokes.max(1);
     let sl = spoke_len.max(1);
@@ -64,13 +66,34 @@ pub fn reduce_for_display(
     }
 
     let mut out = vec![0u8; actual * sl];
+    let copy_row = |out: &mut [u8], i: usize, row: &[u8]| {
+        let dst = (i * actual) / reported;
+        if dst < actual {
+            let dst_start = dst * sl;
+            out[dst_start..dst_start + sl].copy_from_slice(row);
+        }
+    };
+
+    if let Some(indices) = received_indices {
+        if !indices.is_empty() {
+            for &idx in indices {
+                let i = idx as usize;
+                if i >= reported {
+                    continue;
+                }
+                let start = i * sl;
+                let row = &data[start..start + sl];
+                copy_row(&mut out, i, row);
+            }
+            return (out, actual);
+        }
+    }
+
     for i in 0..reported {
         let start = i * sl;
         let row = &data[start..start + sl];
         if row.iter().any(|&b| b != 0) {
-            let dst = (i * actual) / reported;
-            let dst_start = dst * sl;
-            out[dst_start..dst_start + sl].copy_from_slice(row);
+            copy_row(&mut out, i, row);
         }
     }
     (out, actual)
@@ -106,7 +129,7 @@ mod tests {
     fn reduce_maps_filled_rows_into_actual_slots() {
         // reported=4, actual=2 filled at rows 0 and 2 → compact 2 rows
         let data = grid(4, 2, &[&[1, 0], &[], &[2, 3], &[]]);
-        let (out, spokes) = reduce_for_display(&data, 4, 2, None);
+        let (out, spokes) = reduce_for_display(&data, 4, 2, None, None);
         assert_eq!(spokes, 2);
         assert_eq!(out.len(), 4);
         assert_eq!(&out[0..2], &[1, 0]);
@@ -117,7 +140,7 @@ mod tests {
     fn reduce_last_row_wins_on_collision() {
         // reported=4, actual=2 filled at rows 2 and 3 → both dst = 1
         let data = grid(4, 1, &[&[], &[], &[5], &[9]]);
-        let (out, spokes) = reduce_for_display(&data, 4, 1, None);
+        let (out, spokes) = reduce_for_display(&data, 4, 1, None, None);
         assert_eq!(spokes, 2);
         assert_eq!(out, [0, 9]);
     }
@@ -125,7 +148,7 @@ mod tests {
     #[test]
     fn reduce_all_zero_returns_zeros() {
         let data = vec![0u8; 8];
-        let (out, spokes) = reduce_for_display(&data, 4, 2, None);
+        let (out, spokes) = reduce_for_display(&data, 4, 2, None, None);
         assert_eq!(spokes, 1);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|&b| b == 0));
@@ -133,7 +156,7 @@ mod tests {
 
     #[test]
     fn reduce_wrong_len_returns_zeros() {
-        let (out, spokes) = reduce_for_display(&[1, 2, 3], 4, 2, None);
+        let (out, spokes) = reduce_for_display(&[1, 2, 3], 4, 2, None, None);
         assert_eq!(spokes, 1);
         assert_eq!(out.len(), 2);
         assert!(out.iter().all(|&b| b == 0));
@@ -143,10 +166,21 @@ mod tests {
     fn reduce_sampling_row_matches_gui_scale() {
         // reported=8, actual=4; echo only at reported angle index 4 (180°)
         let data = grid(8, 1, &[&[], &[], &[], &[], &[7], &[], &[], &[]]);
-        let (out, spokes) = reduce_for_display(&data, 8, 1, Some(4));
+        let (out, spokes) = reduce_for_display(&data, 8, 1, Some(4), None);
         assert_eq!(spokes, 4);
         let dst = (4 * 4) / 8;
         assert_eq!(dst, 2);
         assert_eq!(out[dst], 7);
+    }
+
+    #[test]
+    fn reduce_sparse_received_includes_zero_rows() {
+        // reported=8, actual=4; spokes at 0 and 4 (sparse stride), row 4 echo only
+        let data = grid(8, 1, &[&[], &[], &[], &[], &[7], &[], &[], &[]]);
+        let indices = [0u16, 4];
+        let (out, spokes) = reduce_for_display(&data, 8, 1, Some(4), Some(&indices));
+        assert_eq!(spokes, 4);
+        assert_eq!(out[0], 0);
+        assert_eq!(out[2], 7);
     }
 }

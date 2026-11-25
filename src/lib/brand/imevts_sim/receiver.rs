@@ -49,6 +49,49 @@ where
     IMRS_SPOKES_DEFAULT
 }
 
+fn env_is_truthy(raw: &str) -> Option<bool> {
+    let v = raw.trim().to_ascii_lowercase();
+    if matches!(v.as_str(), "1" | "true" | "yes" | "on") {
+        return Some(true);
+    }
+    if matches!(v.as_str(), "0" | "false" | "no" | "off") {
+        return Some(false);
+    }
+    None
+}
+
+/// Mirrors `imevts_sim.radar_sensor.sparse.resolve_sparse_mode` (hasSparseSpokes / GUI).
+pub(crate) fn imrs_sparse_enabled() -> bool {
+    imrs_sparse_enabled_with_env(|k| std::env::var(k).ok())
+}
+
+pub(crate) fn imrs_sparse_enabled_with_env<F>(env: F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    if let Some(dense) = env("IMEVTS_SIM_SPOKE_DENSE") {
+        if env_is_truthy(&dense) == Some(true) {
+            return false;
+        }
+    }
+    let mode = env("IMEVTS_SIM_SPOKE_SPARSE")
+        .as_deref()
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase();
+    match mode.as_str() {
+        "off" | "0" | "false" | "dense" => false,
+        "furuno" | "on" | "1" | "true" | "sparse" => true,
+        _ if mode != "auto" => false,
+        _ => imrs_spokes_with_env(&env) >= IMRS_SPOKES_HIRES,
+    }
+}
+
+/// `hasSparseSpokes` / GUI Spoke Processing for ImevtsSim (8192 grade, like Furuno).
+pub(crate) fn imrs_sparse_spokes_flag() -> bool {
+    imrs_spokes() >= IMRS_SPOKES_HIRES || imrs_sparse_enabled()
+}
+
 /// Batch ~1/64 of a revolution before WS flush (one UDP datagram = one spoke).
 const SPOKE_BATCH: usize = 32;
 const NAV_SOURCE: &str = "imevts-sim";
@@ -325,7 +368,7 @@ impl ImevtsSimListener {
             fake_addr,
             |id, tx| settings::new(id, tx, &args_for_controls, &site_for_controls),
             false,
-            false,
+            imrs_sparse_spokes_flag(),
         );
 
         let mut info = self.radars.add(info)?;
@@ -359,6 +402,11 @@ impl ImevtsSimListener {
         let _ = info
             .controls
             .set_value(&ControlId::Range, 4000_f64.into());
+
+        if imrs_sparse_spokes_flag() {
+            // Furuno parity: default PPI Reduce when spokes are sparse (8192 lab).
+            info.controls.set_spoke_processing(2);
+        }
 
         // Align GZ1 to geo-echo usable sector × composition range so Auto-ARPA
         // acquires even when persistence left a disabled zone (same as Emulator).
@@ -573,5 +621,34 @@ mod tests {
             IMRS_SPOKES_DEFAULT,
             "IMEVTS_SIM_SPOKES wins over alias"
         );
+    }
+
+    #[test]
+    fn imrs_sparse_enabled_from_injected_env() {
+        assert!(imrs_sparse_enabled_with_env(|k| {
+            if k == "IMEVTS_SIM_SPOKES" {
+                Some("8192".into())
+            } else {
+                None
+            }
+        }));
+        assert!(!imrs_sparse_enabled_with_env(|k| {
+            if k == "IMEVTS_SIM_SPOKES" {
+                Some("8192".into())
+            } else if k == "IMEVTS_SIM_SPOKE_DENSE" {
+                Some("1".into())
+            } else {
+                None
+            }
+        }));
+        assert!(!imrs_sparse_enabled_with_env(|k| match k {
+            "IMEVTS_SIM_SPOKES" => Some("2048".into()),
+            _ => None,
+        }));
+        assert!(imrs_sparse_enabled_with_env(|k| match k {
+            "IMEVTS_SIM_SPOKE_SPARSE" => Some("furuno".into()),
+            "IMEVTS_SIM_SPOKES" => Some("2048".into()),
+            _ => None,
+        }));
     }
 }

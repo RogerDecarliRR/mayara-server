@@ -64,6 +64,7 @@ pub fn encode(
     legend: &Legend,
     data: &[u8],
     observed_spokes_per_rev: usize,
+    received_indices: &[u16],
 ) -> Result<Vec<u8>, PolarBlobError> {
     let spokes_usize = spokes as usize;
     let spoke_len_usize = spoke_len as usize;
@@ -81,7 +82,11 @@ pub fn encode(
         )));
     }
 
-    let indices = non_zero_row_indices(data, spokes_usize, spoke_len_usize);
+    let indices = if received_indices.is_empty() {
+        non_zero_row_indices(data, spokes_usize, spoke_len_usize)
+    } else {
+        received_indices.to_vec()
+    };
     let filled_count = u32::try_from(indices.len()).map_err(|_| {
         PolarBlobError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -198,6 +203,7 @@ pub fn decode_from_parts(
     legend: Legend,
     payload: &[u8],
 ) -> Result<DecodedPolar, PolarBlobError> {
+  let indices = read_v2_indices(payload)?;
     let data = expand_payload(payload, spokes, spoke_len)?;
     Ok(DecodedPolar {
         revolution_id,
@@ -205,11 +211,28 @@ pub fn decode_from_parts(
         spokes,
         spoke_len,
         observed_spokes_per_rev,
+        received_indices: indices,
         spoke_range_m,
         center,
         legend,
         data,
     })
+}
+
+fn read_v2_indices(payload: &[u8]) -> Result<Vec<u16>, PolarBlobError> {
+    if payload.len() < 4 {
+        return Err(PolarBlobError::Truncated(payload.len()));
+    }
+    let filled_count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let mut out = Vec::with_capacity(filled_count);
+    for i in 0..filled_count {
+        let idx_off = 4 + i * 2;
+        if payload.len() < idx_off + 2 {
+            return Err(PolarBlobError::Truncated(payload.len()));
+        }
+        out.push(u16::from_le_bytes(payload[idx_off..idx_off + 2].try_into().unwrap()));
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -264,6 +287,7 @@ mod tests {
             &legend,
             &data,
             0,
+            &[],
         )
         .expect("encode v2");
         assert_eq!(&blob[0..4], b"MEPO");
@@ -290,6 +314,7 @@ mod tests {
             spokes,
             spoke_len,
             observed_spokes_per_rev: 0,
+            received_indices: Vec::new(),
             center: None,
             spoke_range_m: 500.0,
             legend: legend.clone(),
@@ -313,7 +338,7 @@ mod tests {
             data[s..s + spoke_len as usize].fill(7);
         }
 
-        let v2 = encode(1, 1000, spokes, spoke_len, 100.0, None, &legend, &data, 0).expect("v2");
+        let v2 = encode(1, 1000, spokes, spoke_len, 100.0, None, &legend, &data, 0, &[]).expect("v2");
         let v1 = encode_v1(1, 1000, spokes, spoke_len, 100.0, None, &legend, &data, 0).expect("v1");
         assert!(v2.len() < v1.len(), "v2 {} >= v1 {}", v2.len(), v1.len());
         assert_eq!(decode(&v2).unwrap().data, data);
@@ -324,7 +349,7 @@ mod tests {
         let legend = sample_legend();
         let data = vec![0u8; 8];
         assert!(has_empty_row(&data, 2, 4));
-        let blob = encode(1, 1, 2, 4, 1.0, None, &legend, &data, 0).expect("encode");
+        let blob = encode(1, 1, 2, 4, 1.0, None, &legend, &data, 0, &[]).expect("encode");
         assert_eq!(u16::from_le_bytes(blob[4..6].try_into().unwrap()), VERSION);
         let decoded = decode(&blob).expect("decode");
         assert_eq!(decoded.data, data);
@@ -363,6 +388,7 @@ mod tests {
             spokes: 2,
             spoke_len: 2,
             observed_spokes_per_rev: 0,
+            received_indices: Vec::new(),
             center: Some((1.0, 2.0)),
             spoke_range_m: 500.0,
             legend: legend.clone(),

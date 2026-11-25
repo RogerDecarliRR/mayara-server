@@ -59,6 +59,8 @@ pub struct DecodedPolar {
     pub spokes: u32,
     pub spoke_len: u32,
     pub observed_spokes_per_rev: usize,
+    /// Sparse revolution row indices (MEPO v2 wire); empty for dense v1.
+    pub received_indices: Vec<u16>,
     pub spoke_range_m: f64,
     pub center: Option<(f64, f64)>,
     pub legend: Legend,
@@ -73,6 +75,7 @@ impl DecodedPolar {
             spokes: self.spokes as usize,
             spoke_len: self.spoke_len as usize,
             observed_spokes_per_rev: self.observed_spokes_per_rev,
+            received_indices: self.received_indices.clone(),
             center: self.center,
             spoke_range_m: self.spoke_range_m,
             legend: self.legend,
@@ -197,6 +200,7 @@ pub fn encode_snapshot(snapshot: &PolarSnapshot) -> Result<Vec<u8>, PolarBlobErr
             &snapshot.legend,
             &snapshot.data,
             snapshot.observed_spokes_per_rev,
+            &snapshot.received_indices,
         )
     } else {
         encode(
@@ -274,6 +278,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedPolar, PolarBlobError> {
                 spokes,
                 spoke_len,
                 observed_spokes_per_rev,
+                received_indices: Vec::new(),
                 spoke_range_m,
                 center,
                 legend,

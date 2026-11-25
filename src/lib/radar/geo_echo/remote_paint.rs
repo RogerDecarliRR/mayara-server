@@ -152,8 +152,9 @@ pub fn paint_viewport(
         PolarDisplayMode::Default => (polar.data.clone(), spokes),
         PolarDisplayMode::Reduce => {
             let observed = (polar.observed_spokes_per_rev > 0).then_some(polar.observed_spokes_per_rev);
+            let received = (!polar.received_indices.is_empty()).then_some(polar.received_indices.as_slice());
             let (reduced, display_spokes) =
-                reduce_for_display(&polar.data, spokes, spoke_len, observed);
+                reduce_for_display(&polar.data, spokes, spoke_len, observed, received);
             (reduced, display_spokes)
         }
     };
@@ -265,6 +266,7 @@ mod tests {
             spokes,
             spoke_len,
             observed_spokes_per_rev: 0,
+            received_indices: Vec::new(),
             spoke_range_m: 2_000.0,
             center: Some((-19.85, -40.06)),
             legend: solid_legend(),
