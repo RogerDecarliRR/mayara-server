@@ -122,7 +122,7 @@ fn config_summary(args: &mayara::Cli) -> Value {
     obj.insert("multiple_radar".into(), json!(args.multiple_radar));
     obj.insert("transmit".into(), json!(args.transmit));
     obj.insert("stationary".into(), json!(args.stationary));
-    obj.insert("emulator".into(), json!(args.emulator));
+    obj.insert("emulator".into(), json!(args.emulator_enabled()));
     obj.insert("imevts_sim".into(), json!(args.imevts_sim_enabled()));
     obj.insert(
         "imevts_sim_port".into(),

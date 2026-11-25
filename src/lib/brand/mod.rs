@@ -52,7 +52,7 @@ pub(crate) fn create_brand_listeners(
 
     // When emulator mode is enabled, skip all real radar brands
     #[cfg(feature = "emulator")]
-    if args.emulator {
+    if args.emulator_enabled() {
         emulator::new(args, listen_addresses);
         brands.insert(Brand::Emulator);
         return;

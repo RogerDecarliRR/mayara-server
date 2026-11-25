@@ -13,7 +13,7 @@ mod gain;
 mod receiver;
 mod settings;
 
-/// Like HALO / emulator: 2048 spokes × 1024 bins, 16 legend levels (nibble).
+/// Legend levels (nibble). Spoke count is [`receiver::imrs_spokes`] (2048|8192).
 pub(crate) const PIXEL_VALUES: u8 = 16;
 
 /// Supported ranges in meters (metric subset sufficient for lab).

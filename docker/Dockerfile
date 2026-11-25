@@ -36,7 +36,8 @@ COPY web web/
 RUN --mount=type=cache,id=mayara-cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=mayara-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=mayara-cargo-target,target=/usr/src/mayara-server/target \
-    cargo build --release \
+    # pcap-replay: lab FL pode subir `--pcap` (Furuno fixture em testdata/pcap).
+    cargo build --release --features pcap-replay \
     && cp /usr/src/mayara-server/target/release/mayara-server /usr/src/mayara-server/mayara-server \
     && cp /usr/src/mayara-server/target/release/geo-echo-renderer /usr/src/mayara-server/geo-echo-renderer
 

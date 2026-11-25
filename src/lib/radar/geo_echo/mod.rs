@@ -14,7 +14,10 @@ mod compositor;
 mod corners;
 mod frame;
 mod png;
+mod polar_display_reduce;
+mod polar_viewport_preprocess;
 pub mod polar_blob;
+mod polar_blob_v2;
 pub mod polar_slots;
 mod raster;
 mod remote_paint;
@@ -33,10 +36,15 @@ pub use corners::{corners_for, refresh_interval_ms, EchoCorners, LonLat};
 pub use frame::{Center, EchoFrame, EchoMeta, SizePx};
 pub use png::{transparent_png, DEFAULT_ECHO_SIZE_PX};
 pub use polar_blob::{decode, encode, encode_snapshot, DecodedPolar, PolarBlobError};
+pub use polar_display_reduce::{PolarDisplayMode, reduce_for_display};
+pub use polar_viewport_preprocess::{
+    deserialize_option_bool_lenient, preprocess_viewport_polar, ViewportPaintOptions,
+};
 pub use polar_slots::PolarSlots;
 pub use raster::{
     bearing_in_sector, deserialize_option_u32_lenient, effective_viewport_max_size_px,
-    snap_size_hint_to_allowed, view_range_from_bbox, view_spoke_coverage_m, viewport_size_px, BBox,
+    snap_size_hint_to_allowed, view_range_from_bbox, view_spoke_coverage_m, viewport_size_px,
+    ViewportSampleMode, BBox,
 };
 pub use remote_paint::{paint_viewport, ViewportPaintRequest, ViewportPaintResult};
 pub use renderer_client::{push_polar_snapshot, renderer_base_url, should_push_to_renderer};

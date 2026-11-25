@@ -211,7 +211,9 @@ pub struct Cli {
     #[arg(long, conflicts_with = "signalk_token")]
     pub signalk_token_file: Option<std::path::PathBuf>,
 
-    /// Use emulator radar instead of real radar discovery
+    /// Use emulator radar instead of real radar discovery.
+    /// Also gated by env `MAYARA_EMULATOR` via [`Self::emulator_enabled`]
+    /// (`0` forces off even with this flag; non-empty other value forces on).
     #[arg(long, default_value_t = false)]
     pub emulator: bool,
 
@@ -326,6 +328,32 @@ impl Cli {
                 !t.is_empty() && t != "0"
             }
             Err(_) => false,
+        }
+    }
+
+    /// Whether the HALO-style emulator brand should start (RM-143 / FL-1).
+    ///
+    /// Env `MAYARA_EMULATOR`: trim `0` → off (overrides `--emulator`); any other
+    /// non-empty value → on; unset/blank → [`Self::emulator`].
+    pub fn emulator_enabled(&self) -> bool {
+        self.emulator_enabled_with_env(|k| std::env::var(k).ok())
+    }
+
+    /// Inner resolver with an injected env source (tests; no `set_var`).
+    pub(crate) fn emulator_enabled_with_env<F>(&self, env: F) -> bool
+    where
+        F: FnOnce(&str) -> Option<String>,
+    {
+        match env("MAYARA_EMULATOR") {
+            Some(v) => {
+                let t = v.trim();
+                if t.is_empty() {
+                    self.emulator
+                } else {
+                    t != "0"
+                }
+            }
+            None => self.emulator,
         }
     }
 
@@ -1655,5 +1683,45 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    fn emulator_env(value: Option<&str>) -> impl FnOnce(&str) -> Option<String> + '_ {
+        move |k| {
+            if k == "MAYARA_EMULATOR" {
+                value.map(str::to_string)
+            } else {
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn emulator_enabled_follows_cli_when_env_unset() {
+        let off = parse_cli(&[]);
+        assert!(!off.emulator_enabled_with_env(emulator_env(None)));
+        let on = parse_cli(&["--emulator"]);
+        assert!(on.emulator_enabled_with_env(emulator_env(None)));
+    }
+
+    #[test]
+    fn emulator_env_0_overrides_cli_flag() {
+        let cli = parse_cli(&["--emulator"]);
+        assert!(!cli.emulator_enabled_with_env(emulator_env(Some("0"))));
+        assert!(!cli.emulator_enabled_with_env(emulator_env(Some(" 0 "))));
+    }
+
+    #[test]
+    fn emulator_env_nonzero_enables_without_cli() {
+        let cli = parse_cli(&[]);
+        assert!(cli.emulator_enabled_with_env(emulator_env(Some("1"))));
+        assert!(cli.emulator_enabled_with_env(emulator_env(Some("true"))));
+    }
+
+    #[test]
+    fn emulator_env_blank_falls_back_to_cli() {
+        let off = parse_cli(&[]);
+        assert!(!off.emulator_enabled_with_env(emulator_env(Some("  \t  "))));
+        let on = parse_cli(&["--emulator"]);
+        assert!(on.emulator_enabled_with_env(emulator_env(Some(""))));
     }
 }

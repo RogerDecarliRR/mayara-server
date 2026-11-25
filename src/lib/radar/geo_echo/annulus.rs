@@ -398,6 +398,48 @@ pub fn sample_view_polar_nearest(
     view[b_idx * n_radial + r_idx]
 }
 
+/// Bilinear sample of a view-polar strip (bearing wraps, range clamps at edges).
+pub fn sample_view_polar_bilinear(
+    view: &[u8],
+    spokes: usize,
+    n_radial: usize,
+    r_min_m: f64,
+    m_per_bin: f64,
+    range_m: f64,
+    bearing_deg: f64,
+) -> u8 {
+    if spokes == 0 || n_radial == 0 || view.len() < spokes * n_radial || m_per_bin <= 0.0 {
+        return 0;
+    }
+    let u = (range_m - r_min_m) / m_per_bin;
+    if u < 0.0 || u >= n_radial as f64 {
+        return 0;
+    }
+    let uf = u.clamp(0.0, (n_radial - 1) as f64);
+    let r0 = uf.floor() as usize;
+    let r1 = (r0 + 1).min(n_radial - 1);
+    let dr = (uf - r0 as f64) as f32;
+
+    let bf = (bearing_deg.rem_euclid(360.0) / 360.0) * spokes as f64;
+    let s0 = bf.floor() as usize % spokes;
+    let s1 = (s0 + 1) % spokes;
+    let ds = (bf - bf.floor()) as f32;
+
+    let at = |sp: usize, rd: usize| -> f32 { view[sp * n_radial + rd] as f32 };
+    let v00 = at(s0, r0);
+    let v10 = at(s1, r0);
+    let v01 = at(s0, r1);
+    let v11 = at(s1, r1);
+    let top = v00 * (1.0_f32 - ds) + v10 * ds;
+    let bot = v01 * (1.0_f32 - ds) + v11 * ds;
+    let v = top * (1.0_f32 - dr) + bot * dr;
+    if v < 0.5 {
+        0
+    } else {
+        v.round().min(255.0) as u8
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

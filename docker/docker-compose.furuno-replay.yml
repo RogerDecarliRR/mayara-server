@@ -1,0 +1,23 @@
+# Override do lab: replay Furuno DRS4D-NXT (fixture Mayara) em loop.
+# Uso (na raiz imevts, com imagem já buildada com --features pcap-replay):
+#   MAYARA_EMULATOR=0 \
+#   docker compose -f mayara/docker/docker-compose.lab.yml \
+#     -f mayara/docker/docker-compose.furuno-replay.yml \
+#     up -d --force-recreate mayara-server
+#
+# GUI: http://127.0.0.1:6502/gui/ — radar Furuno (não ims…). Parar replay:
+#   voltar ao compose.lab.yml sem este override + recreate.
+services:
+  mayara-server:
+    command:
+      [
+        "mayara-server",
+        "--pcap",
+        "/pcap/furuno-drs4dnxt.pcap.gz",
+        "--repeat",
+      ]
+    environment:
+      MAYARA_EMULATOR: "0"
+      MAYARA_MEPO_COMPACT: ${MAYARA_MEPO_COMPACT:-0}
+    volumes:
+      - ../testdata/pcap:/pcap:ro

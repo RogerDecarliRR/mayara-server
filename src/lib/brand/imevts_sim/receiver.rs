@@ -20,9 +20,35 @@ use crate::{Brand, Cli};
 pub(crate) const MAGIC: &[u8] = b"IMRS";
 pub(crate) const VERSION: u8 = 1;
 pub(crate) const MAX_SITE_KEY: usize = 32;
-pub(crate) const IMRS_SPOKES: usize = 2048;
+/// Default spokes/rev (HALO-like lab density). Override via [`imrs_spokes`].
+pub(crate) const IMRS_SPOKES_DEFAULT: usize = 2048;
+pub(crate) const IMRS_SPOKES_HIRES: usize = 8192;
 pub(crate) const IMRS_SPOKE_LEN: usize = 1024;
 pub(crate) const HEADING_NONE: u16 = 0xFFFF;
+
+/// Spokes per revolution from `IMEVTS_SIM_SPOKES` or alias `MAYARA_IMRS_SPOKES`
+/// (only `2048` or `8192`; default [`IMRS_SPOKES_DEFAULT`]).
+pub(crate) fn imrs_spokes() -> usize {
+    imrs_spokes_with_env(|k| std::env::var(k).ok())
+}
+
+/// Injected env source for unit tests (no `set_var`).
+pub(crate) fn imrs_spokes_with_env<F>(env: F) -> usize
+where
+    F: Fn(&str) -> Option<String>,
+{
+    for key in ["IMEVTS_SIM_SPOKES", "MAYARA_IMRS_SPOKES"] {
+        if let Some(v) = env(key) {
+            match v.trim() {
+                "8192" => return IMRS_SPOKES_HIRES,
+                "2048" => return IMRS_SPOKES_DEFAULT,
+                _ => {}
+            }
+        }
+    }
+    IMRS_SPOKES_DEFAULT
+}
+
 /// Batch ~1/64 of a revolution before WS flush (one UDP datagram = one spoke).
 const SPOKE_BATCH: usize = 32;
 const NAV_SOURCE: &str = "imevts-sim";
@@ -42,6 +68,11 @@ pub(crate) struct ImrsSpoke {
 
 /// Parse one IMRS v1 datagram. Returns `None` on malformed / unsupported input.
 pub(crate) fn parse_imrs(packet: &[u8]) -> Option<ImrsSpoke> {
+    parse_imrs_with_spokes(packet, imrs_spokes())
+}
+
+/// Like [`parse_imrs`] with an explicit spokes count (tests / config).
+pub(crate) fn parse_imrs_with_spokes(packet: &[u8], spokes: usize) -> Option<ImrsSpoke> {
     if packet.len() < 6 || &packet[..4] != MAGIC {
         return None;
     }
@@ -82,12 +113,13 @@ pub(crate) fn parse_imrs(packet: &[u8]) -> Option<ImrsSpoke> {
     if n_bins as usize != IMRS_SPOKE_LEN {
         return None;
     }
-    if angle >= IMRS_SPOKES as u16 {
+    let spokes_u16 = spokes.min(u16::MAX as usize) as u16;
+    if angle >= spokes_u16 {
         return None;
     }
     let heading = if heading_raw == HEADING_NONE {
         None
-    } else if heading_raw < IMRS_SPOKES as u16 {
+    } else if heading_raw < spokes_u16 {
         Some(heading_raw)
     } else {
         None
@@ -129,7 +161,7 @@ pub(crate) struct ImevtsSimListener {
 
 impl ImevtsSimListener {
     pub(crate) fn new(args: &Cli, radars: SharedRadars, port: u16) -> Self {
-        let publish_nav = !args.emulator;
+        let publish_nav = !args.emulator_enabled();
         Self {
             args: args.clone(),
             radars,
@@ -146,10 +178,37 @@ impl ImevtsSimListener {
 
     pub(crate) async fn run(mut self, subsys: &mut SubsystemHandle) -> Result<(), RadarError> {
         let bind = SocketAddr::from((Ipv4Addr::UNSPECIFIED, self.port));
-        let socket = UdpSocket::bind(bind).await.map_err(|e| {
-            log::error!("ImevtsSim: bind {bind} failed: {e}");
-            RadarError::Io(e)
-        })?;
+        // FL / RM-143: 8192 spokes/rev ≈ 3k datagrams/s; default rmem (~212 KiB)
+        // drops bursts (ARPA no sítio errado + eco vazio). socket2 → 16 MiB
+        // (capped by net.core.rmem_max); depois Tokio UdpSocket.
+        const IMRS_RECV_BUF: usize = 16 * 1024 * 1024;
+        let socket = {
+            use socket2::{Domain, Protocol, Type};
+            let sock = socket2::Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
+                .map_err(|e| {
+                    log::error!("ImevtsSim: socket new failed: {e}");
+                    RadarError::Io(e)
+                })?;
+            sock.set_nonblocking(true).map_err(RadarError::Io)?;
+            sock.set_reuse_address(true).map_err(RadarError::Io)?;
+            match sock.set_recv_buffer_size(IMRS_RECV_BUF) {
+                Ok(()) => match sock.recv_buffer_size() {
+                    Ok(n) => log::info!(
+                        "ImevtsSim: UDP recv buffer {n} bytes (requested {IMRS_RECV_BUF})"
+                    ),
+                    Err(e) => log::warn!("ImevtsSim: recv_buffer_size: {e}"),
+                },
+                Err(e) => log::warn!("ImevtsSim: set_recv_buffer_size({IMRS_RECV_BUF}): {e}"),
+            }
+            sock.bind(&bind.into()).map_err(|e| {
+                log::error!("ImevtsSim: bind {bind} failed: {e}");
+                RadarError::Io(e)
+            })?;
+            UdpSocket::from_std(sock.into()).map_err(|e| {
+                log::error!("ImevtsSim: tokio from_std failed: {e}");
+                RadarError::Io(e)
+            })?
+        };
         log::info!("ImevtsSim: UDP bound on {bind}");
 
         let mut buf = vec![0u8; 6 + MAX_SITE_KEY + 30 + IMRS_SPOKE_LEN + 64];
@@ -257,7 +316,7 @@ impl ImevtsSimListener {
             None,
             None,
             PIXEL_VALUES,
-            IMRS_SPOKES,
+            imrs_spokes(),
             IMRS_SPOKE_LEN,
             fake_addr,
             Ipv4Addr::LOCALHOST,
@@ -451,5 +510,68 @@ mod tests {
     fn parse_rejects_truncated() {
         let pkt = encode_spoke("site", 1.0, 2.0, 3.0, 4, 5, HEADING_NONE, &[1, 2, 3]);
         assert!(parse_imrs(&pkt[..20]).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_angle_at_or_above_spokes() {
+        let pkt = encode_spoke(
+            "x",
+            0.0,
+            0.0,
+            0.0,
+            1000,
+            IMRS_SPOKES_DEFAULT as u16,
+            HEADING_NONE,
+            &[0],
+        );
+        assert!(parse_imrs_with_spokes(&pkt, IMRS_SPOKES_DEFAULT).is_none());
+        assert!(parse_imrs_with_spokes(&pkt, IMRS_SPOKES_HIRES).is_some());
+    }
+
+    #[test]
+    fn parse_accepts_high_angle_when_spokes_8192() {
+        let pkt = encode_spoke("x", 0.0, 0.0, 0.0, 1000, 5000, HEADING_NONE, &[0]);
+        assert!(parse_imrs_with_spokes(&pkt, IMRS_SPOKES_DEFAULT).is_none());
+        let spoke = parse_imrs_with_spokes(&pkt, IMRS_SPOKES_HIRES).expect("8192");
+        assert_eq!(spoke.angle, 5000);
+    }
+
+    #[test]
+    fn imrs_spokes_from_injected_env() {
+        assert_eq!(
+            imrs_spokes_with_env(|_| Some("8192".into())),
+            IMRS_SPOKES_HIRES
+        );
+        assert_eq!(
+            imrs_spokes_with_env(|_| Some("2048".into())),
+            IMRS_SPOKES_DEFAULT
+        );
+        assert_eq!(
+            imrs_spokes_with_env(|_| Some("999".into())),
+            IMRS_SPOKES_DEFAULT
+        );
+        assert_eq!(
+            imrs_spokes_with_env(|k| {
+                if k == "MAYARA_IMRS_SPOKES" {
+                    Some("8192".into())
+                } else {
+                    None
+                }
+            }),
+            IMRS_SPOKES_HIRES
+        );
+        assert_eq!(
+            imrs_spokes_with_env(|k| {
+                if k == "IMEVTS_SIM_SPOKES" {
+                    Some("2048".into())
+                } else if k == "MAYARA_IMRS_SPOKES" {
+                    Some("8192".into())
+                } else {
+                    None
+                }
+            }),
+            IMRS_SPOKES_DEFAULT,
+            "IMEVTS_SIM_SPOKES wins over alias"
+        );
     }
 }

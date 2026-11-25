@@ -764,7 +764,7 @@ pub(super) fn new(args: &Cli, addresses: &mut Vec<LocatorAddress>) {
     // physical radar to wake).
     if !args.is_replay() {
         #[cfg(feature = "emulator")]
-        if args.emulator {
+        if args.emulator_enabled() {
             return;
         }
         tokio::spawn(cdm_heartbeat::run());

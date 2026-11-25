@@ -93,6 +93,7 @@ mod tests {
             period_ms: 1000,
             spokes: 1,
             spoke_len: 1,
+            observed_spokes_per_rev: 0,
             spoke_range_m: 100.0,
             center: None,
             legend: stub_legend(),

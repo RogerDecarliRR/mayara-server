@@ -9,9 +9,11 @@ use super::corners::refresh_interval_ms;
 use super::frame::{now_unix_ms, Center, EchoFrame, EchoMeta, SizePx};
 use super::png::encode_rgba;
 use super::polar_blob::DecodedPolar;
+use super::polar_display_reduce::{PolarDisplayMode, reduce_for_display};
+use super::polar_viewport_preprocess::{preprocess_viewport_polar, ViewportPaintOptions};
 use super::raster::{
-    effective_viewport_max_size_px, rasterize_viewport, viewport_image_corners, viewport_size_px,
-    BBox,
+    effective_viewport_max_size_px, rasterize_viewport_with_world, viewport_image_corners,
+    viewport_size_px, ViewportSampleMode, BBox,
 };
 use crate::config::{GeoEchoConfig, GEO_ECHO_MIN_TARGET_M_PER_PX};
 
@@ -34,6 +36,12 @@ pub struct ViewportPaintRequest {
     pub max_viewport_range_m: Option<f64>,
     /// Optional paint max edge (`sizeHintPx` / `sizeHint`); caps `max_size_px` (W2 A3/C1).
     pub size_hint: Option<u32>,
+    /// Viewport-only PPI remap (`echoPolarDisplay`); composition path ignores this (v1).
+    pub polar_display: PolarDisplayMode,
+    /// Separable polar smooth + bilinear view sample (RM-145).
+    pub viewport_smooth: bool,
+    /// Scale non-zero legend indices before paint (`1.0` = no change).
+    pub weak_gain: f32,
 }
 
 impl ViewportPaintRequest {
@@ -61,7 +69,14 @@ impl ViewportPaintRequest {
             target_meters_per_px: geo.target_meters_per_px,
             max_viewport_range_m: geo.max_viewport_range_m,
             size_hint: None,
+            polar_display: PolarDisplayMode::Default,
+            viewport_smooth: false,
+            weak_gain: 1.0,
         }
+    }
+
+    pub fn paint_options(&self) -> ViewportPaintOptions {
+        ViewportPaintOptions::from_request(self.viewport_smooth, self.weak_gain)
     }
 }
 
@@ -133,9 +148,28 @@ pub fn paint_viewport(
         });
     };
 
-    let rgba = rasterize_viewport(
-        &polar.data,
-        spokes,
+    let (polar_data, raster_spokes) = match req.polar_display {
+        PolarDisplayMode::Default => (polar.data.clone(), spokes),
+        PolarDisplayMode::Reduce => {
+            let observed = (polar.observed_spokes_per_rev > 0).then_some(polar.observed_spokes_per_rev);
+            let (reduced, display_spokes) =
+                reduce_for_display(&polar.data, spokes, spoke_len, observed);
+            (reduced, display_spokes)
+        }
+    };
+    let paint_opts = req.paint_options();
+    let smooth_on = paint_opts.effective_smooth(req.polar_display == PolarDisplayMode::Reduce);
+    let mut opts = paint_opts;
+    opts.viewport_smooth = smooth_on;
+    let polar_data = preprocess_viewport_polar(polar_data, raster_spokes, spoke_len, opts);
+    let sample_mode = if smooth_on {
+        ViewportSampleMode::Bilinear
+    } else {
+        ViewportSampleMode::Nearest
+    };
+    let rgba = rasterize_viewport_with_world(
+        &polar_data,
+        raster_spokes,
         spoke_len,
         &polar.legend,
         size_px,
@@ -147,6 +181,8 @@ pub fn paint_viewport(
         req.usable_bearing_start_deg,
         req.usable_bearing_end_deg,
         req.usable_radius_m,
+        None,
+        sample_mode,
     );
     let png = encode_rgba(size_px, size_px, &rgba)
         .map_err(|e| format!("png encode failed: {e}"))?;
@@ -228,6 +264,7 @@ mod tests {
             period_ms: 1500,
             spokes,
             spoke_len,
+            observed_spokes_per_rev: 0,
             spoke_range_m: 2_000.0,
             center: Some((-19.85, -40.06)),
             legend: solid_legend(),
@@ -254,6 +291,9 @@ mod tests {
             target_meters_per_px: 20.0,
             max_viewport_range_m: Some(14.0 * 1852.0),
             size_hint: None,
+            polar_display: PolarDisplayMode::Default,
+            viewport_smooth: false,
+            weak_gain: 1.0,
         };
         let result = paint_viewport(&polar, &req).expect("paint");
         assert!(result.meta.available);
@@ -282,6 +322,9 @@ mod tests {
             target_meters_per_px: 50.0,
             max_viewport_range_m: None,
             size_hint: None,
+            polar_display: PolarDisplayMode::Default,
+            viewport_smooth: false,
+            weak_gain: 1.0,
         };
         let result = paint_viewport(&polar, &req).expect("paint");
         assert!(!result.meta.available);
@@ -306,6 +349,9 @@ mod tests {
             target_meters_per_px: 50.0,
             max_viewport_range_m: None,
             size_hint: None,
+            polar_display: PolarDisplayMode::Default,
+            viewport_smooth: false,
+            weak_gain: 1.0,
         };
         let err = paint_viewport(&polar, &req).unwrap_err();
         assert!(err.contains("radar_lat"));
@@ -337,6 +383,9 @@ mod tests {
             target_meters_per_px: 1.0,
             max_viewport_range_m: Some(14.0 * 1852.0),
             size_hint: None,
+            polar_display: PolarDisplayMode::Default,
+            viewport_smooth: false,
+            weak_gain: 1.0,
         };
         let full = paint_viewport(&polar, &req_full).expect("full");
         let mut req_half = req_full.clone();
@@ -364,6 +413,9 @@ mod tests {
             target_meters_per_px: 50.0,
             max_viewport_range_m: Some(2000.0),
             size_hint: None,
+            polar_display: PolarDisplayMode::Default,
+            viewport_smooth: false,
+            weak_gain: 1.0,
         };
         let result = paint_viewport(&polar, &req).expect("small paint");
         assert_eq!(result.meta.size_px.width, result.meta.size_px.height);

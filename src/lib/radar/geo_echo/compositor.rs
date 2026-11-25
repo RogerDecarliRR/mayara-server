@@ -9,10 +9,11 @@ use super::annulus::{
     bbox_half_min_span_m, snap_range_step_up, view_m_per_bin, VIEWPORT_RANGE_STEPS_M,
 };
 use super::polar_blob;
+use super::polar_display_reduce::{PolarDisplayMode, reduce_for_display};
+use super::polar_viewport_preprocess::{preprocess_viewport_polar, ViewportPaintOptions};
 use super::raster::{
-    rasterize_polar_masked, rasterize_viewport, rasterize_viewport_with_world,
-    effective_viewport_max_size_px, view_range_from_bbox, viewport_image_corners, viewport_size_px,
-    BBox,
+    rasterize_polar_masked, rasterize_viewport_with_world, effective_viewport_max_size_px,
+    view_range_from_bbox, viewport_image_corners, viewport_size_px, ViewportSampleMode, BBox,
 };
 use super::sampler::{fill_polar_from_world, ViewportWorldSampler};
 use super::state::{PolarBuffer, RevClock};
@@ -33,6 +34,8 @@ pub struct PolarSnapshot {
     pub data: Vec<u8>,
     pub spokes: usize,
     pub spoke_len: usize,
+    /// Spokes counted in a revolution (sparse radar); PPI reduce display axis.
+    pub observed_spokes_per_rev: usize,
     pub center: Option<(f64, f64)>,
     pub spoke_range_m: f64,
     pub legend: Legend,
@@ -46,6 +49,7 @@ impl PolarSnapshot {
             data: Vec::new(),
             spokes: 0,
             spoke_len: 0,
+            observed_spokes_per_rev: 0,
             center: None,
             spoke_range_m: 0.0,
             legend,
@@ -188,6 +192,8 @@ pub fn publish_viewport(
     bbox: BBox,
     site: Option<(f64, f64)>,
     size_hint: Option<u32>,
+    polar_display: PolarDisplayMode,
+    paint_opts: ViewportPaintOptions,
 ) -> Result<EchoMeta, String> {
     bbox.validate()?;
     let (_, viewport_slot, snapshot_slot) = ensure_entry(radars, radar_id)
@@ -271,12 +277,35 @@ pub fn publish_viewport(
             geo.usable_bearing_end_deg,
             geo.effective_usable_radius_m(),
             Some(&echo),
+            ViewportSampleMode::Nearest,
         )
     } else {
-        rasterize_viewport(
-            &snap.data,
-            snap.spokes.max(1),
-            snap.spoke_len.max(1),
+        let spokes_n = spokes;
+        let spoke_len_n = spoke_len;
+        let (polar_data, raster_spokes): (Vec<u8>, usize) = match polar_display {
+            PolarDisplayMode::Default => (snap.data.clone(), spokes_n),
+            PolarDisplayMode::Reduce => {
+                let observed = (snap.observed_spokes_per_rev > 0).then_some(snap.observed_spokes_per_rev);
+                let (reduced, display_spokes) =
+                    reduce_for_display(&snap.data, spokes_n, spoke_len_n, observed);
+                (reduced, display_spokes)
+            }
+        };
+        let smooth_on =
+            paint_opts.effective_smooth(polar_display == PolarDisplayMode::Reduce);
+        let mut opts = paint_opts;
+        opts.viewport_smooth = smooth_on;
+        let polar_data =
+            preprocess_viewport_polar(polar_data, raster_spokes, spoke_len_n, opts);
+        let sample_mode = if smooth_on {
+            ViewportSampleMode::Bilinear
+        } else {
+            ViewportSampleMode::Nearest
+        };
+        rasterize_viewport_with_world(
+            &polar_data,
+            raster_spokes,
+            spoke_len_n,
             &snap.legend,
             size_px,
             lat,
@@ -287,6 +316,8 @@ pub fn publish_viewport(
             geo.usable_bearing_start_deg,
             geo.usable_bearing_end_deg,
             geo.effective_usable_radius_m(),
+            None,
+            sample_mode,
         )
     };
     let png_bytes = encode_rgba(size_px, size_px, &rgba)
@@ -541,6 +572,7 @@ fn store_snapshot(
         data: data.to_vec(),
         spokes: polar.spokes,
         spoke_len: polar.spoke_len,
+        observed_spokes_per_rev: clock.observed_spokes_per_rev,
         center: polar.last_center.or_else(resolve_nav_center),
         spoke_range_m,
         legend: legend.clone(),

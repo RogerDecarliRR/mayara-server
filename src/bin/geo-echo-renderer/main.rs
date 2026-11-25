@@ -10,8 +10,8 @@ use axum::{Json, Router};
 use clap::Parser;
 use mayara::config::GeoEchoConfig;
 use mayara::radar::geo_echo::{
-    deserialize_option_u32_lenient, paint_viewport, polar_blob, EchoFrame, EchoMeta, PolarSlots,
-    ViewportPaintRequest,
+    deserialize_option_u32_lenient, paint_viewport, polar_blob, EchoFrame, EchoMeta, PolarDisplayMode,
+    PolarSlots, ViewportPaintRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -83,6 +83,15 @@ struct ViewportPost {
         deserialize_with = "deserialize_option_u32_lenient"
     )]
     size_hint_px: Option<u32>,
+    #[serde(default)]
+    echo_polar_display: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "mayara::radar::geo_echo::deserialize_option_bool_lenient"
+    )]
+    echo_viewport_smooth: Option<bool>,
+    #[serde(default)]
+    echo_weak_gain: Option<f64>,
 }
 
 /// BBox echo in the response (same shape as SignalK ViewportRequest).
@@ -217,6 +226,13 @@ fn paint_request_from_post(body: &ViewportPost) -> Result<ViewportPaintRequest, 
         &geo,
     );
     req.size_hint = body.size_hint_px;
+    req.polar_display = PolarDisplayMode::from_option(body.echo_polar_display.as_deref());
+    req.viewport_smooth = body.echo_viewport_smooth.unwrap_or(false);
+    req.weak_gain = body
+        .echo_weak_gain
+        .filter(|g| g.is_finite() && *g > 0.0)
+        .map(|g| g as f32)
+        .unwrap_or(1.0);
     Ok(req)
 }
 

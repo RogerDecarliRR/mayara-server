@@ -2,6 +2,7 @@
 # + geo-echo-renderer na 6503 + UDP IMRS 6510 (FK-3.1 / RM-124).
 # Subir: ../scripts/dev/up-local.sh
 # FK-1 smoke: --emulator (cenário embutido HALO). IMRS: sim imevts → UDP 6510 → brand ImevtsSim.
+# FL-1 / RM-143: MAYARA_EMULATOR=0 desliga o emulador mesmo com --emulator (default ligado).
 # Config/share em named volumes (sobrevivem recreate/rebuild); tmpfs só em /tmp.
 services:
   mayara-server:
@@ -14,6 +15,7 @@ services:
       network: host
     image: mayara-server:local
     # --emulator HALO + --imevts-sim (UDP IMRS from imevts sim; both coexist).
+    # MAYARA_EMULATOR=0 → emulator_enabled() false; brand não sobe.
     command: ["mayara-server", "--emulator", "--imevts-sim"]
     ports:
       - "${MAYARA_HOST_PORT:-6502}:6502"
@@ -21,6 +23,13 @@ services:
       - "${MAYARA_IMEVTS_SIM_HOST_PORT:-6510}:6510/udp"
     environment:
       GEO_ECHO_RENDERER_URL: http://geo-echo-renderer:6503
+      # FL-1 / RM-143: 0 = sem emulador; default 1 (ligado).
+      MAYARA_EMULATOR: ${MAYARA_EMULATOR:-1}
+      # Mesmo valor no sim e no receiver IMRS (2048|8192; default 2048).
+      IMEVTS_SIM_SPOKES: ${IMEVTS_SIM_SPOKES:-2048}
+      MAYARA_IMRS_SPOKES: ${MAYARA_IMRS_SPOKES:-}
+      # FL / RM-142: 0 = MEPO sempre v1 denso (~8 MiB a 8192); default compacta v2.
+      MAYARA_MEPO_COMPACT: ${MAYARA_MEPO_COMPACT:-1}
     networks:
       - mayara-lab
     volumes:

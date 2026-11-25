@@ -52,6 +52,8 @@ impl PolarBuffer {
 pub(super) struct RevClock {
     prev_index: Option<usize>,
     spokes_this_rev: u32,
+    /// Max spokes counted in one revolution (sparse PPI reduce parity GUI).
+    pub observed_spokes_per_rev: usize,
     last_rev_end: Option<Instant>,
     last_period: Duration,
     last_publish: Option<Instant>,
@@ -65,6 +67,7 @@ impl RevClock {
         Self {
             prev_index: None,
             spokes_this_rev: 0,
+            observed_spokes_per_rev: 0,
             last_rev_end: None,
             last_period: Duration::from_secs(2),
             last_publish: None,
@@ -82,6 +85,12 @@ impl RevClock {
     }
 
     pub fn close_revolution(&mut self) {
+        if self.spokes_this_rev > 0 {
+            let n = self.spokes_this_rev as usize;
+            if n > self.observed_spokes_per_rev {
+                self.observed_spokes_per_rev = n;
+            }
+        }
         let now = Instant::now();
         if let Some(prev_end) = self.last_rev_end {
             let p = now.saturating_duration_since(prev_end);

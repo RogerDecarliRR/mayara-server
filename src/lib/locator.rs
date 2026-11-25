@@ -131,7 +131,7 @@ impl Locator {
 
         // Handle emulator mode - create radar directly without network discovery
         #[cfg(feature = "emulator")]
-        if self.args.emulator {
+        if self.args.emulator_enabled() {
             log::info!("Emulator mode: creating emulator radar directly");
             crate::brand::emulator::create_emulator_radar(&self.args, radars, subsys);
 

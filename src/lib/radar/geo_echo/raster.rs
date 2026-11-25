@@ -358,6 +358,14 @@ pub fn view_spoke_coverage_m(view_range_m: f64) -> f64 {
     view_range_m.max(0.0) * 1.5
 }
 
+/// How view-polar intensities are read when inverse-sampling the viewport.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewportSampleMode {
+    #[default]
+    Nearest,
+    Bilinear,
+}
+
 /// Inverse-sample a north-up square covering `bbox` from an annular sector
 /// about the radar asset.
 ///
@@ -395,6 +403,7 @@ pub fn rasterize_viewport(
         usable_bearing_end_deg,
         usable_radius_m,
         None,
+        ViewportSampleMode::Nearest,
     )
 }
 
@@ -417,10 +426,12 @@ pub fn rasterize_viewport_with_world(
     usable_bearing_end_deg: f64,
     usable_radius_m: f64,
     world_echo: Option<&dyn Fn(f64, f64) -> u8>,
+    sample_mode: ViewportSampleMode,
 ) -> Vec<u8> {
     use super::annulus::{
         annulus_from_bbox, bearing_deg_from_east_north, build_view_polar,
-        build_view_polar_from_sampler, sample_view_polar_nearest, view_m_per_bin,
+        build_view_polar_from_sampler, sample_view_polar_bilinear, sample_view_polar_nearest,
+        view_m_per_bin,
     };
 
     let size = size_px.max(1) as usize;
@@ -510,15 +521,26 @@ pub fn rasterize_viewport_with_world(
                     continue;
                 }
 
-                let pix = sample_view_polar_nearest(
-                    &view_polar,
-                    spokes,
-                    n_radial,
-                    r_min_m,
-                    m_per_bin,
-                    r,
-                    theta,
-                );
+                let pix = match sample_mode {
+                    ViewportSampleMode::Bilinear => sample_view_polar_bilinear(
+                        &view_polar,
+                        spokes,
+                        n_radial,
+                        r_min_m,
+                        m_per_bin,
+                        r,
+                        theta,
+                    ),
+                    ViewportSampleMode::Nearest => sample_view_polar_nearest(
+                        &view_polar,
+                        spokes,
+                        n_radial,
+                        r_min_m,
+                        m_per_bin,
+                        r,
+                        theta,
+                    ),
+                };
                 if pix == 0 {
                     continue;
                 }
@@ -1111,6 +1133,7 @@ mod tests {
             360.0,
             f64::INFINITY,
             Some(&echo),
+            ViewportSampleMode::Nearest,
         );
         let rgba_b = rasterize_viewport_with_world(
             &junk_b,
@@ -1127,6 +1150,7 @@ mod tests {
             360.0,
             f64::INFINITY,
             Some(&echo),
+            ViewportSampleMode::Nearest,
         );
         let mask = |rgba: &[u8]| -> Vec<bool> {
             rgba.chunks(4).map(|px| px[3] > 0).collect()

@@ -764,6 +764,19 @@ struct ViewportRequest {
     /// Ceiling for viewport range-step snap (metres). Override from imevts asset SoT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     max_viewport_range_m: Option<f64>,
+    /// PPI row remap for viewport paint (`default` | `reduce`). Omit → default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    echo_polar_display: Option<String>,
+    /// Separable polar smooth + bilinear inverse sample (RM-145).
+    #[serde(
+        default,
+        deserialize_with = "geo_echo::deserialize_option_bool_lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
+    echo_viewport_smooth: Option<bool>,
+    /// Weak-gain scale on non-zero legend indices before viewport paint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    echo_weak_gain: Option<f64>,
 }
 
 /// Viewport render result — same shape as `echo.json` plus PNG path and scale.
@@ -1151,8 +1164,18 @@ async fn post_echo_viewport(
         east: request.east,
         north: request.north,
     };
-    match geo_echo::publish_viewport(&state.radars, &radar_id, bbox, site, request.size_hint_px)
-    {
+    let polar_display =
+        geo_echo::PolarDisplayMode::from_option(request.echo_polar_display.as_deref());
+    let paint_opts = viewport_paint_options_from_request(&request);
+    match geo_echo::publish_viewport(
+        &state.radars,
+        &radar_id,
+        bbox,
+        site,
+        request.size_hint_px,
+        polar_display,
+        paint_opts,
+    ) {
         Ok(meta) => {
             let (span_ew, span_ns) = bbox.spans_m();
             let span = span_ew.max(span_ns).max(1e-6);
@@ -1181,6 +1204,16 @@ fn renderer_http_client() -> &'static reqwest::Client {
             .build()
             .unwrap_or_else(|_| reqwest::Client::new())
     })
+}
+
+fn viewport_paint_options_from_request(request: &ViewportRequest) -> geo_echo::ViewportPaintOptions {
+    let smooth = request.echo_viewport_smooth.unwrap_or(false);
+    let gain = request
+        .echo_weak_gain
+        .filter(|g| g.is_finite() && *g > 0.0)
+        .map(|g| g as f32)
+        .unwrap_or(1.0);
+    geo_echo::ViewportPaintOptions::from_request(smooth, gain)
 }
 
 async fn forward_echo_viewport(
@@ -1219,6 +1252,15 @@ async fn forward_echo_viewport(
     });
     if let Some(hint) = request.size_hint_px {
         body["sizeHintPx"] = serde_json::json!(hint);
+    }
+    if let Some(ref mode) = request.echo_polar_display {
+        body["echoPolarDisplay"] = serde_json::json!(mode);
+    }
+    if let Some(smooth) = request.echo_viewport_smooth {
+        body["echoViewportSmooth"] = serde_json::json!(smooth);
+    }
+    if let Some(gain) = request.echo_weak_gain.filter(|g| g.is_finite()) {
+        body["echoWeakGain"] = serde_json::json!(gain);
     }
     let url = format!("{base}/v1/viewport");
     match renderer_http_client().post(&url).json(&body).send().await {
@@ -3174,6 +3216,31 @@ mod tests {
         .expect("bbox-only must deserialize");
         assert!(bare.usable_radius_m.is_none());
         assert!(bare.max_size_px.is_none());
+    }
+
+    #[test]
+    fn viewport_request_echo_polar_display_deserializes() {
+        let req: ViewportRequest = serde_json::from_str(
+            r#"{"west":-40.08,"south":-19.87,"east":-40.04,"north":-19.83,"echoPolarDisplay":"reduce"}"#,
+        )
+        .expect("echoPolarDisplay reduce must deserialize");
+        assert_eq!(req.echo_polar_display.as_deref(), Some("reduce"));
+        let bare: ViewportRequest = serde_json::from_str(
+            r#"{"west":-40.08,"south":-19.87,"east":-40.04,"north":-19.83}"#,
+        )
+        .expect("bbox-only");
+        assert!(bare.echo_polar_display.is_none());
+    }
+
+    #[test]
+    fn viewport_request_preprocess_knobs_deserialize() {
+        let req: ViewportRequest = serde_json::from_str(
+            r#"{"west":-40.08,"south":-19.87,"east":-40.04,"north":-19.83,
+                "echoViewportSmooth":"on","echoWeakGain":0.75}"#,
+        )
+        .expect("preprocess knobs");
+        assert_eq!(req.echo_viewport_smooth, Some(true));
+        assert_eq!(req.echo_weak_gain, Some(0.75));
     }
 
     /// A dual-range radar offers two entries, and clients that take the
