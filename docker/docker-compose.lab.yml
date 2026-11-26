@@ -50,7 +50,7 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    restart: unless-stopped
+    restart: ${IMEVTS_DOCKER_RESTART:-no}
 
   geo-echo-renderer:
     container_name: mayara-geo-echo-renderer
@@ -74,7 +74,7 @@ services:
       timeout: 5s
       start_period: 10s
       retries: 3
-    restart: unless-stopped
+    restart: ${IMEVTS_DOCKER_RESTART:-no}
 
 networks:
   mayara-lab:

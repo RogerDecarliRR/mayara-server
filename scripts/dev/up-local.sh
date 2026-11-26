@@ -6,6 +6,15 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 COMPOSE_FILE="$ROOT/docker/docker-compose.lab.yml"
+# Lab imevts: política de restart vem do .env da raiz (default no = sem auto-start no boot do Docker).
+IMEVTS_ENV="$ROOT/../.env"
+if [[ -f "$IMEVTS_ENV" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$IMEVTS_ENV"
+  set +a
+fi
+export IMEVTS_DOCKER_RESTART="${IMEVTS_DOCKER_RESTART:-no}"
 CONTAINER="mayara-local"
 IMAGE_LOCAL="mayara-server:local"
 IMAGE_GHCR="ghcr.io/marineyachtradar/mayara-server:latest"
@@ -75,7 +84,7 @@ print_footer() {
   echo "Logs:      docker logs -f $CONTAINER"
   echo "Parar:     ./scripts/dev/down-local.sh"
   echo
-  echo "Auto-start: restart=unless-stopped — com docker.service enabled, o container volta ao abrir WSL."
+  echo "Auto-start: IMEVTS_DOCKER_RESTART=${IMEVTS_DOCKER_RESTART:-no} (unless-stopped no .env para ligar ao abrir o Docker/WSL)."
   echo "Rebuild:    ./scripts/dev/up-local.sh --build  (reusa BuildKit; só :local atual fica)"
   echo "Nota:       primeiro build Rust pode demorar; rebuilds seguintes reusam apk/cargo."
 }
