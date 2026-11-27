@@ -681,6 +681,10 @@ struct GeoEchoApi {
     #[serde(default)]
     #[schema(example = "sidecar")]
     echo_paint: EchoPaint,
+    /// ARPA blob sensitivity (0.5–2.0; default 1.0).
+    #[serde(default)]
+    #[schema(example = 1.0)]
+    arpa_sensitivity: f64,
 }
 
 impl From<&GeoEchoConfig> for GeoEchoApi {
@@ -697,6 +701,7 @@ impl From<&GeoEchoConfig> for GeoEchoApi {
             // Always expose the effective radius so clients see a concrete value.
             usable_radius_m: Some(cfg.effective_usable_radius_m()),
             echo_paint: cfg.echo_paint,
+            arpa_sensitivity: cfg.arpa_sensitivity,
         }
     }
 }
@@ -714,6 +719,7 @@ impl From<GeoEchoApi> for GeoEchoConfig {
             usable_bearing_end_deg: api.usable_bearing_end_deg,
             usable_radius_m: api.usable_radius_m,
             echo_paint: api.echo_paint,
+            arpa_sensitivity: api.arpa_sensitivity,
         }
     }
 }

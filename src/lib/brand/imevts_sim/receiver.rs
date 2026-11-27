@@ -450,8 +450,6 @@ impl ImevtsSimListener {
             arpa_tx,
         );
         common.set_spoke_batch_threshold(SPOKE_BATCH);
-        // geo-arpa: expose ARPA tracker tracks (dims estimated from blob extent).
-        self.radars.ensure_tracker_monitor_enumerator(&key);
         let levels = ReceiverLevels::from_controls(&common.info.controls);
         Some(SiteRadar {
             common,

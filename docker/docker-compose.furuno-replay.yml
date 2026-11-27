@@ -1,12 +1,13 @@
 # Override do lab: replay Furuno DRS4D-NXT (fixture Mayara) em loop.
 # Uso (na raiz imevts, com imagem já buildada com --features pcap-replay):
-#   MAYARA_EMULATOR=0 \
-#   docker compose -f mayara/docker/docker-compose.lab.yml \
-#     -f mayara/docker/docker-compose.furuno-replay.yml \
-#     up -d --force-recreate mayara-server
+#   ./scripts/dev/mayara-furuno-replay.sh
 #
 # GUI: http://127.0.0.1:6502/gui/ — radar Furuno (não ims…). Parar replay:
 #   voltar ao compose.lab.yml sem este override + recreate.
+#
+# --static-position: o pcap de spokes sozinho não traz GPS; sem lat/lon o
+# BlobDetector gera blobs válidos mas o tracker descarta (blob_to_position).
+# Default = Barra do Riacho / porto alvo (ajuste via MAYARA_REPLAY_LAT/LON/HDG).
 services:
   mayara-server:
     command:
@@ -15,6 +16,10 @@ services:
         "--pcap",
         "/pcap/furuno-drs4dnxt.pcap.gz",
         "--repeat",
+        "--static-position",
+        "${MAYARA_REPLAY_LAT:--19.851}",
+        "${MAYARA_REPLAY_LON:--40.066}",
+        "${MAYARA_REPLAY_HDG:-0}",
       ]
     environment:
       MAYARA_EMULATOR: "0"

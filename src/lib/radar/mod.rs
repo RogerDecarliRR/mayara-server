@@ -1078,6 +1078,9 @@ pub struct SharedRadars {
         Arc<RwLock<HashMap<String, geo_arpa::MonitorContactEnumerator>>>,
     /// ARPA tracker → geo-arpa contact snapshot (ImevtsSim / hardware).
     monitor_contact_snapshot: geo_arpa::MonitorContactSnapshot,
+    /// Bumped on each successful [`Self::set_geo_echo_config`] so live receivers
+    /// refresh blob GZ1 / ARPA sensitivity without persistence.
+    geo_echo_revision: Arc<AtomicU64>,
 }
 
 impl Default for SharedRadars {
@@ -1101,7 +1104,12 @@ impl SharedRadars {
             viewport_world_samplers: Arc::new(RwLock::new(HashMap::new())),
             monitor_contact_enumerators: Arc::new(RwLock::new(HashMap::new())),
             monitor_contact_snapshot: geo_arpa::empty_snapshot(),
+            geo_echo_revision: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    pub(crate) fn geo_echo_revision(&self) -> u64 {
+        self.geo_echo_revision.load(Ordering::Relaxed)
     }
 
     /// Shared snapshot filled by [`target::TrackerManager`] each revolution.
@@ -1260,6 +1268,7 @@ impl SharedRadars {
             let mut radars = self.radars.write().unwrap();
             radars.persistent_data.set_geo_echo(cfg)?
         };
+        self.geo_echo_revision.fetch_add(1, Ordering::Relaxed);
         let zone = saved.arpa_acquisition_guard_zone();
         for mut info in self.get_active() {
             info.controls
@@ -2186,6 +2195,8 @@ pub(crate) struct CommonRadar {
     exclusion_mask: Option<exclusion::ExclusionMask>,
     current_exclusion_range: u32,
     current_exclusion_spoke_len: usize,
+    /// Last seen [`SharedRadars::geo_echo_revision`] for blob GZ1 / sensitivity sync.
+    last_geo_echo_revision: u64,
 }
 
 impl CommonRadar {
@@ -2201,27 +2212,40 @@ impl CommonRadar {
         let trails = TrailBuffer::new(&info);
         let spoke_message = None;
 
+        if info.targets == TargetMode::Arpa {
+            let gz1 = radars.geo_echo_config().arpa_acquisition_guard_zone();
+            info.controls
+                .set_guard_zone(&ControlId::GuardZone1, &gz1);
+        }
+
         // Create blob detector if ARPA mode is enabled
         let blob_detector = if info.targets == TargetMode::Arpa {
-            log::info!(
-                "{}: BlobDetector created with threshold={} (strong return), spokes={}",
-                key,
-                info.legend.strong_return,
-                info.spokes_per_revolution
-            );
+            let geo = radars.geo_echo_config();
             let mut detector =
                 BlobDetector::new(info.spokes_per_revolution, info.legend.strong_return);
             detector.set_doppler(
                 info.legend.doppler_approaching,
                 info.legend.doppler_receding,
             );
-            // Initialize guard zones from current control values
+            let sens = geo.clamped_arpa_sensitivity();
+            detector.apply_arpa_sensitivity(sens, info.legend.strong_return);
+            log::info!(
+                "{}: BlobDetector created with threshold={} (strong_return={}, S={:.2}), spokes={}",
+                key,
+                detector.threshold(),
+                info.legend.strong_return,
+                sens,
+                info.spokes_per_revolution,
+            );
             detector.set_guard_zone_1(info.controls.guard_zone(&ControlId::GuardZone1));
             detector.set_guard_zone_2(info.controls.guard_zone(&ControlId::GuardZone2));
+            radars.ensure_tracker_monitor_enumerator(&key);
             Some(detector)
         } else {
             None
         };
+
+        let last_geo_echo_revision = radars.geo_echo_revision();
 
         // Initialize exclusion zones from control values (stationary only)
         let exclusion_zones = [
@@ -2260,7 +2284,31 @@ impl CommonRadar {
             exclusion_mask: None,
             current_exclusion_range: 0,
             current_exclusion_spoke_len: 0,
+            last_geo_echo_revision,
         }
+    }
+
+    fn maybe_sync_blob_from_geo_echo(&mut self) {
+        if self.blob_detector.is_none() {
+            return;
+        }
+        let revision = self.radars.geo_echo_revision();
+        if revision == self.last_geo_echo_revision {
+            return;
+        }
+        let geo = self.radars.geo_echo_config();
+        let gz1 = geo.arpa_acquisition_guard_zone();
+        self.info
+            .controls
+            .set_guard_zone(&ControlId::GuardZone1, &gz1);
+        if let Some(ref mut detector) = self.blob_detector {
+            detector.set_guard_zone_1(self.info.controls.guard_zone(&ControlId::GuardZone1));
+            detector.apply_arpa_sensitivity(
+                geo.clamped_arpa_sensitivity(),
+                self.info.legend.strong_return,
+            );
+        }
+        self.last_geo_echo_revision = revision;
     }
 
     pub(crate) fn update(&mut self) {
@@ -2685,6 +2733,11 @@ impl CommonRadar {
         // a fresh one if we just flushed, or reuses the existing one).
         self.new_spoke_message();
         self.batch_range = Some(range);
+
+        // Sync GZ1 / arpaSensitivity before borrowing spoke_message.
+        if self.blob_detector.is_some() {
+            self.maybe_sync_blob_from_geo_echo();
+        }
 
         if let Some(message) = &mut self.spoke_message {
             // In replay mode, draw a circle at extreme range for visual indication
@@ -3182,6 +3235,16 @@ mod tests {
         let legend = default_legend(&targets, 1, false, 16);
         let json = serde_json::to_string_pretty(&legend).unwrap();
         println!("{}", json);
+    }
+
+    #[test]
+    fn arpa_common_radar_registers_tracker_monitor_enumerator() {
+        let radars = SharedRadars::new();
+        radars.ensure_tracker_monitor_enumerator("furuno-live");
+        assert!(
+            radars.monitor_contact_enumerator("furuno-live").is_some(),
+            "tracker snapshot enumerator must be registered for geo-arpa"
+        );
     }
 
     #[test]

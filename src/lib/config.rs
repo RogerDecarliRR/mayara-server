@@ -214,6 +214,19 @@ pub struct GeoEchoConfig {
     /// Monitor paint path: `sidecar` (PUT renderer) or `gpu` (MEPO to client).
     #[serde(default, rename = "echoPaint", alias = "echo_paint")]
     pub echo_paint: EchoPaint,
+    /// ARPA blob acquisition scale: higher = more sensitive (lower threshold,
+    /// fewer pixels required). Clamped to [`ARPA_SENSITIVITY_MIN`]..=[`ARPA_SENSITIVITY_MAX`].
+    #[serde(default = "default_arpa_sensitivity", rename = "arpaSensitivity")]
+    pub arpa_sensitivity: f64,
+}
+
+/// Lower bound for [`GeoEchoConfig::arpa_sensitivity`].
+pub const ARPA_SENSITIVITY_MIN: f64 = 0.5;
+/// Upper bound for [`GeoEchoConfig::arpa_sensitivity`].
+pub const ARPA_SENSITIVITY_MAX: f64 = 2.0;
+
+fn default_arpa_sensitivity() -> f64 {
+    1.0
 }
 
 impl Default for GeoEchoConfig {
@@ -229,6 +242,7 @@ impl Default for GeoEchoConfig {
             usable_bearing_end_deg: default_usable_bearing_end_deg(),
             usable_radius_m: None,
             echo_paint: EchoPaint::Sidecar,
+            arpa_sensitivity: default_arpa_sensitivity(),
         }
     }
 }
@@ -288,7 +302,17 @@ impl GeoEchoConfig {
             Some(m) if m > self.composition_range_m => Some(self.composition_range_m),
             Some(m) => Some(m),
         };
+        self.arpa_sensitivity = self.clamped_arpa_sensitivity();
         self
+    }
+
+    /// ARPA sensitivity clamped to the supported range.
+    pub fn clamped_arpa_sensitivity(&self) -> f64 {
+        if !self.arpa_sensitivity.is_finite() {
+            return default_arpa_sensitivity();
+        }
+        self.arpa_sensitivity
+            .clamp(ARPA_SENSITIVITY_MIN, ARPA_SENSITIVITY_MAX)
     }
 
     /// Guard zone 1 for Auto-ARPA acquisition: usable bearings × usable radius.
@@ -358,6 +382,15 @@ impl GeoEchoConfig {
         }
         if !bearing_in_closed_range(self.usable_bearing_end_deg) {
             return Err("usableBearingEndDeg must be between 0 and 360 (inclusive)".to_string());
+        }
+        if !self.arpa_sensitivity.is_finite()
+            || self.arpa_sensitivity < ARPA_SENSITIVITY_MIN
+            || self.arpa_sensitivity > ARPA_SENSITIVITY_MAX
+        {
+            return Err(format!(
+                "arpaSensitivity must be between {} and {}",
+                ARPA_SENSITIVITY_MIN, ARPA_SENSITIVITY_MAX
+            ));
         }
         Ok(())
     }
@@ -1047,11 +1080,37 @@ mod tests {
         assert!((cfg.usable_bearing_start_deg - 0.0).abs() < 1e-9);
         assert!((cfg.usable_bearing_end_deg - 360.0).abs() < 1e-9);
         assert!(cfg.usable_radius_m.is_none());
+        assert!((cfg.arpa_sensitivity - 1.0).abs() < 1e-9);
         assert!(
             (cfg.effective_usable_radius_m() - cfg.composition_range_m).abs() < 1e-9,
             "omit/legacy usableRadiusM follows composition"
         );
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn arpa_sensitivity_serde_round_trip_and_clamp() {
+        let cfg = GeoEchoConfig {
+            arpa_sensitivity: 1.75,
+            ..GeoEchoConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains("arpaSensitivity"));
+        let back: GeoEchoConfig = serde_json::from_str(&json).unwrap();
+        assert!((back.arpa_sensitivity - 1.75).abs() < 1e-9);
+
+        let legacy: GeoEchoConfig = serde_json::from_str(
+            r#"{"mode":"viewport","composition_range_m":25928.0,"echo_size_px":2048,"target_meters_per_px":2.0,"max_size_px":2048,"usable_bearing_start_deg":0.0,"usable_bearing_end_deg":360.0}"#,
+        )
+        .unwrap();
+        assert!((legacy.arpa_sensitivity - 1.0).abs() < 1e-9);
+
+        let clamped = GeoEchoConfig {
+            arpa_sensitivity: 9.0,
+            ..GeoEchoConfig::default()
+        }
+        .normalized();
+        assert!((clamped.arpa_sensitivity - ARPA_SENSITIVITY_MAX).abs() < 1e-9);
     }
 
     #[test]
@@ -1196,6 +1255,7 @@ mod tests {
             usable_bearing_end_deg: 350.0,
             usable_radius_m: Some(4.0 * 1852.0),
             echo_paint: EchoPaint::Gpu,
+            arpa_sensitivity: default_arpa_sensitivity(),
         };
         let json = serde_json::to_string(&cfg).unwrap();
         assert!(json.contains("usable_radius_m") || json.contains("usableRadiusM"));

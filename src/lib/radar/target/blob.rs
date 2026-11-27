@@ -23,11 +23,9 @@ use crate::radar::{spoke_in_arc, zone_is_full_circle};
 /// This is overridden by legend.strong_return which varies per radar brand.
 const DEFAULT_BLOB_THRESHOLD: u8 = 10;
 
-/// Minimum number of strong-return pixels a blob must contain to be considered a valid target.
-/// At 25km range each pixel is ~25m, so 25 pixels is the minimum for a plausible vessel return.
-/// Thin streaks (wave crests, clutter arcs) typically have < 20 strong pixels despite large
-/// bounding-box sizes; real vessels at this range produce dense clusters of 50+ pixels.
-const MIN_TARGET_PIXELS: usize = 25;
+/// Baseline minimum strong-return pixels before [`GeoEchoConfig::arpa_sensitivity`]
+/// scaling (effective `max(5, round(25 / S))`).
+pub(crate) const BASE_MIN_TARGET_PIXELS: usize = 25;
 
 /// Hard cap on the pixels retained by one in-progress blob. A blob that is
 /// extended on every spoke (e.g. a saturated clutter disk around own ship)
@@ -295,20 +293,24 @@ pub struct BlobDetector {
     guard_zone_2: Option<GuardZone>,
     /// Active guard zones in spoke/pixel coordinates
     guard_zones: Vec<GuardZoneInternal>,
+    /// Legend strong return before sensitivity scaling (for `apply_arpa_sensitivity`).
+    strong_return_base: u8,
+    /// Minimum completed-blob pixel count after sensitivity (default = [`BASE_MIN_TARGET_PIXELS`]).
+    min_target_pixels: usize,
 }
 
 impl BlobDetector {
     /// A detector without Doppler bands; [`Self::set_doppler`] gives it
     /// the radar's.
     pub fn new(spokes_per_revolution: u16, threshold: u8) -> Self {
-        let threshold = if threshold > 0 {
+        let strong_return_base = if threshold > 0 {
             threshold
         } else {
             DEFAULT_BLOB_THRESHOLD
         };
-        BlobDetector {
+        let mut detector = BlobDetector {
             spokes_per_revolution,
-            threshold,
+            threshold: strong_return_base,
             doppler_approaching_range: None,
             doppler_receding_range: None,
             next_blob_id: 1,
@@ -323,7 +325,41 @@ impl BlobDetector {
             guard_zone_1: None,
             guard_zone_2: None,
             guard_zones: Vec::new(),
-        }
+            strong_return_base,
+            min_target_pixels: BASE_MIN_TARGET_PIXELS,
+        };
+        detector.apply_arpa_sensitivity(1.0, strong_return_base);
+        detector
+    }
+
+    fn effective_threshold(strong_return: u8, sensitivity: f64) -> u8 {
+        let base = if strong_return > 0 {
+            strong_return
+        } else {
+            DEFAULT_BLOB_THRESHOLD
+        };
+        std::cmp::max(1, (f64::from(base) / sensitivity).round() as u8)
+    }
+
+    fn effective_min_pixels(sensitivity: f64) -> usize {
+        std::cmp::max(5, (f64::from(BASE_MIN_TARGET_PIXELS as u32) / sensitivity).round() as usize)
+    }
+
+    /// Effective intensity threshold after [`Self::apply_arpa_sensitivity`].
+    pub(crate) fn threshold(&self) -> u8 {
+        self.threshold
+    }
+
+    /// Scale blob threshold and minimum pixel count from geo-echo ARPA sensitivity.
+    pub(crate) fn apply_arpa_sensitivity(&mut self, sensitivity: f64, strong_return: u8) {
+        let s = sensitivity.clamp(crate::config::ARPA_SENSITIVITY_MIN, crate::config::ARPA_SENSITIVITY_MAX);
+        self.strong_return_base = if strong_return > 0 {
+            strong_return
+        } else {
+            DEFAULT_BLOB_THRESHOLD
+        };
+        self.threshold = Self::effective_threshold(self.strong_return_base, s);
+        self.min_target_pixels = Self::effective_min_pixels(s);
     }
 
     /// Take the Doppler bands of a legend that changed after the detector
@@ -713,7 +749,7 @@ impl BlobDetector {
                 SpokeArc::from_blob(&blob, self.spokes_per_revolution, &mut spoke_arc_scratch);
             let size = self.calculate_size(&blob, &spoke_arc);
             let pixel_count = blob.pixels.len();
-            let valid = pixel_count >= MIN_TARGET_PIXELS
+            let valid = pixel_count >= self.min_target_pixels
                 && (MIN_TARGET_SIZE_M..=MAX_TARGET_SIZE_M).contains(&size);
             log::debug!(
                 "BlobDetector: completed blob with {} pixels, size {:.1}m (valid: {})",
@@ -1307,5 +1343,27 @@ mod tests {
 
         // A spoke well outside the configured sector must not match.
         assert!(detector.check_guard_zones(900, 500).is_empty());
+    }
+
+    #[test]
+    fn arpa_sensitivity_high_accepts_marginal_blob() {
+        // 4 spokes × 4 radial bins = 16 strong pixels; size ≈ 7.8 m (≥ 5 m).
+        // S=1.0 needs 25 pixels → reject; S=2.0 needs 13 → accept.
+        const SPOKES: u16 = 2048;
+        let completes = |sensitivity: f64| -> usize {
+            let mut detector = BlobDetector::new(SPOKES, 10);
+            detector.apply_arpa_sensitivity(sensitivity, 10);
+            let mut completed = Vec::new();
+            for angle in 100..109 {
+                let mut spoke = spoke_with(angle, 512, &[]);
+                if angle < 104 {
+                    spoke.data[300..304].fill(10);
+                }
+                completed.extend(detector.process_spoke(&spoke));
+            }
+            completed.len()
+        };
+        assert_eq!(completes(1.0), 0, "S=1.0 requires 25 pixels");
+        assert_eq!(completes(2.0), 1, "S=2.0 requires 13 pixels");
     }
 }
